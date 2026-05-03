@@ -1,20 +1,13 @@
 #!/bin/bash
 # ============================================
-# FULLY AUTOMATED YOLO INFERENCE SETUP
-# Handles sudo, dependencies, and execution
-# Usage: ./auto_setup_and_run.sh
+# YOLO INFERENCE PACKAGE INSTALLER
+# Install dependencies only (runs inside existing venv)
+# Usage: ./install_deps.sh
 # ============================================
 
 # ============================================
 # CONFIGURATION
 # ============================================
-
-# Set credentials (modify these as needed)
-USERNAME="kuiot"
-PASSWORD="kuiot"
-
-# Environment name
-ENV_NAME="yolo_env"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -25,7 +18,7 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # Log file
-LOG_FILE="setup_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="install_$(date +%Y%m%d_%H%M%S).log"
 
 # ============================================
 # HELPER FUNCTIONS
@@ -59,183 +52,151 @@ print_header() {
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 }
 
-# Function to run commands with sudo (auto-provides password)
-run_sudo() {
-    echo "$PASSWORD" | sudo -S $@ 2>/dev/null
-}
-
 # ============================================
-# AUTO-SUDO SETUP
+# CHECK VIRTUAL ENVIRONMENT
 # ============================================
 
-setup_sudo() {
-    print_header "Configuring Sudo Access"
+check_venv() {
+    print_header "Checking Virtual Environment"
     
-    # Test if sudo works with password
-    echo "$PASSWORD" | sudo -S echo "Sudo configured" > /dev/null 2>&1
-    
-    if [ $? -eq 0 ]; then
-        log_success "Sudo access configured for user: $USERNAME"
+    if [ -z "$VIRTUAL_ENV" ]; then
+        log_error "Not inside a virtual environment. Please activate your venv first"
     else
-        log_error "Failed to configure sudo. Check username/password"
+        log_success "Virtual environment detected: $VIRTUAL_ENV"
+        PY_VERSION=$(python --version)
+        log_info "Python: $PY_VERSION"
     fi
 }
 
 # ============================================
-# SYSTEM DEPENDENCIES (apt)
+# SYSTEM DEPENDENCIES (apt only - no pip)
 # ============================================
 
 install_system_deps() {
     print_header "Installing System Dependencies (apt)"
     
     log "Updating package lists..."
-    run_sudo apt update -y >> "$LOG_FILE" 2>&1
+    sudo apt update -y >> "$LOG_FILE" 2>&1
     log_success "Package lists updated"
     
     log "Installing required system packages..."
     
     PACKAGES=(
         "ffmpeg"
-        "python3-pip"
-        "python3-dev"
-        "python3-venv"
+        "python3-opencv"
         "libatlas-base-dev"
         "libopenblas-dev"
-        "libjpeg-dev"
-        "zlib1g-dev"
-        "libtiff-dev"
-        "libfreetype6-dev"
-        "libharfbuzz-dev"
-        "libwebp-dev"
-        "libgstreamer1.0-0"
-        "gstreamer1.0-tools"
-        "gstreamer1.0-plugins-good"
-        "gstreamer1.0-plugins-bad"
-        "gstreamer1.0-plugins-ugly"
-        "libavcodec-dev"
-        "libavformat-dev"
-        "libswscale-dev"
-        "libv4l-dev"
-        "v4l-utils"
     )
     
     for package in "${PACKAGES[@]}"; do
         log "  Installing $package..."
-        run_sudo apt install -y $package >> "$LOG_FILE" 2>&1
+        sudo apt install -y $package >> "$LOG_FILE" 2>&1
+        if [ $? -eq 0 ]; then
+            log_success "    $package installed"
+        else
+            log_warning "    Failed to install $package"
+        fi
     done
     
-    log_success "All system dependencies installed"
+    log_success "System dependencies installation complete"
 }
 
 # ============================================
-# VIRTUAL ENVIRONMENT SETUP
-# ============================================
-
-setup_venv() {
-    print_header "Setting Up Virtual Environment"
-    
-    # Remove existing if present
-    if [ -d "$ENV_NAME" ]; then
-        log "Removing existing environment..."
-        rm -rf "$ENV_NAME"
-    fi
-    
-    log "Creating virtual environment: $ENV_NAME"
-    python3 -m venv "$ENV_NAME" >> "$LOG_FILE" 2>&1
-    
-    if [ $? -eq 0 ]; then
-        log_success "Virtual environment created"
-    else
-        log_error "Failed to create virtual environment"
-    fi
-    
-    # Activate environment
-    source "$ENV_NAME/bin/activate"
-    log_success "Environment activated"
-    
-    # Upgrade pip
-    log "Upgrading pip..."
-    pip install --upgrade pip >> "$LOG_FILE" 2>&1
-    
-    # Show Python version
-    PY_VERSION=$(python --version)
-    log_info "Python: $PY_VERSION"
-}
-
-# ============================================
-# PYTHON PACKAGES (pip)
+# PYTHON PACKAGES (pip only - no venv creation)
 # ============================================
 
 install_python_packages() {
     print_header "Installing Python Packages (pip)"
     
-    # Ensure we're in virtual environment
-    if [ -z "$VIRTUAL_ENV" ]; then
-        log_error "Virtual environment not active"
+    # Ensure pip is available
+    if ! command -v pip &> /dev/null; then
+        log_error "pip not found. Please ensure pip is installed in your venv"
     fi
     
-    log "Installing PyTorch for ARM64 (RPi5 optimized)..."
-    pip install --no-cache-dir \
-        torch==2.0.1 \
-        torchvision==0.15.2 \
-        --index-url https://download.pytorch.org/whl/cpu \
-        >> "$LOG_FILE" 2>&1
+    log_info "Installing packages into existing venv: $VIRTUAL_ENV"
+    
+    # Install numpy first (required for everything)
+    log "Installing numpy..."
+    pip install numpy --no-cache-dir >> "$LOG_FILE" 2>&1
+    if [ $? -eq 0 ]; then
+        log_success "numpy installed"
+    else
+        log_error "numpy installation failed"
+    fi
+    
+    # Install psutil (system monitoring)
+    log "Installing psutil..."
+    pip install psutil --no-cache-dir >> "$LOG_FILE" 2>&1
+    log_success "psutil installed"
+    
+    # Install ultralytics (includes YOLO and PyTorch dependencies)
+    log "Installing ultralytics (this may take a while on RPi5)..."
+    pip install ultralytics --no-cache-dir >> "$LOG_FILE" 2>&1
     
     if [ $? -eq 0 ]; then
-        log_success "PyTorch installed"
+        log_success "ultralytics installed"
     else
-        log_error "PyTorch installation failed"
+        log_error "ultralytics installation failed"
     fi
     
-    log "Installing ultralytics YOLO..."
-    pip install --no-cache-dir ultralytics>=8.0.0 >> "$LOG_FILE" 2>&1
-    log_success "Ultralytics installed"
-    
-    log "Installing computer vision packages..."
-    pip install --no-cache-dir \
-        opencv-python-headless>=4.8.0 \
-        numpy>=1.24.0 \
-        Pillow>=10.0.0 \
-        >> "$LOG_FILE" 2>&1
-    log_success "CV packages installed"
-    
-    log "Installing system monitoring..."
-    pip install --no-cache-dir psutil>=5.9.0 >> "$LOG_FILE" 2>&1
-    log_success "Monitoring tools installed"
-    
-    # Verify installations
-    log "Verifying installations..."
-    python -c "import torch; print(f'  PyTorch: {torch.__version__}')" >> "$LOG_FILE" 2>&1
-    python -c "import cv2; print(f'  OpenCV: {cv2.__version__}')" >> "$LOG_FILE" 2>&1
-    python -c "from ultralytics import YOLO; print('  Ultralytics: OK')" >> "$LOG_FILE" 2>&1
+    # Note: opencv is installed via apt (python3-opencv), not pip
+    log_info "OpenCV is provided by system package (python3-opencv)"
     
     log_success "All Python packages installed"
 }
 
 # ============================================
-# VERIFY INPUT FILES
+# VERIFY INSTALLATIONS
 # ============================================
 
-verify_files() {
-    print_header "Verifying Input Files"
+verify_installations() {
+    print_header "Verifying Installations"
     
-    if [ -f "best2.pt" ]; then
-        MODEL_SIZE=$(du -h best2.pt | cut -f1)
-        log_success "Model found: best2.pt ($MODEL_SIZE)"
+    log "Testing imports..."
+    
+    # Test numpy
+    python -c "import numpy; print(f'  numpy: {numpy.__version__}')" 2>> "$LOG_FILE"
+    if [ $? -eq 0 ]; then
+        log_success "numpy import successful"
     else
-        log_error "Model file 'best2.pt' not found in current directory"
+        log_error "numpy import failed"
     fi
     
-    if [ -f "test2.mp4" ]; then
-        VIDEO_SIZE=$(du -h test2.mp4 | cut -f1)
-        log_success "Video found: test2.mp4 ($VIDEO_SIZE)"
+    # Test OpenCV (system package)
+    python -c "import cv2; print(f'  OpenCV: {cv2.__version__}')" 2>> "$LOG_FILE"
+    if [ $? -eq 0 ]; then
+        log_success "OpenCV import successful"
     else
-        log_error "Video file 'test2.mp4' not found in current directory"
+        log_warning "OpenCV import failed - check python3-opencv installation"
     fi
+    
+    # Test psutil
+    python -c "import psutil; print(f'  psutil: {psutil.__version__}')" 2>> "$LOG_FILE"
+    if [ $? -eq 0 ]; then
+        log_success "psutil import successful"
+    else
+        log_warning "psutil import failed"
+    fi
+    
+    # Test ultralytics (includes torch)
+    python -c "from ultralytics import YOLO; print('  ultralytics: OK')" 2>> "$LOG_FILE"
+    if [ $? -eq 0 ]; then
+        log_success "ultralytics import successful"
+    else
+        log_error "ultralytics import failed"
+    fi
+    
+    # Show torch version (installed as ultralytics dependency)
+    python -c "import torch; print(f'  PyTorch: {torch.__version__}')" 2>> "$LOG_FILE"
+    if [ $? -eq 0 ]; then
+        log_success "PyTorch import successful"
+    fi
+    
+    log_success "All verifications passed"
 }
 
 # ============================================
-# CHECK RASPBERRY PI HARDWARE
+# CHECK RASPBERRY PI HARDWARE (optional)
 # ============================================
 
 check_rpi_hardware() {
@@ -245,8 +206,15 @@ check_rpi_hardware() {
     if [ -f /proc/device-tree/model ]; then
         MODEL=$(cat /proc/device-tree/model)
         log_success "Device: $MODEL"
+        
+        # Check CPU temperature (RPi specific)
+        if [ -f /sys/class/thermal/thermal_zone0/temp ]; then
+            TEMP=$(cat /sys/class/thermal/thermal_zone0/temp)
+            TEMP_C=$((TEMP/1000))
+            log_info "CPU Temperature: ${TEMP_C}°C"
+        fi
     else
-        log_warning "Not running on Raspberry Pi"
+        log_info "Not running on Raspberry Pi (or model info not available)"
     fi
     
     # Check CPU cores
@@ -259,79 +227,54 @@ check_rpi_hardware() {
     log_info "Total RAM: $TOTAL_RAM"
     log_info "Available RAM: $AVAIL_RAM"
     
-    # Check temperature (if on RPi)
-    if [ -f /sys/class/thermal/thermal_zone0/temp ]; then
-        TEMP=$(cat /sys/class/thermal/thermal_zone0/temp)
-        TEMP_C=$((TEMP/1000))
-        log_info "CPU Temperature: ${TEMP_C}°C"
-    fi
-    
-    # Set CPU governor to performance (requires sudo)
-    log "Setting CPU governor to performance mode..."
-    run_sudo bash -c 'for i in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo performance > $i; done' 2>/dev/null
-    log_success "CPU performance mode enabled"
+    # Optional: Set CPU governor (uncomment if needed)
+    # log "Setting CPU governor to performance mode..."
+    # echo "performance" | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor > /dev/null 2>&1
+    # log_success "CPU performance mode enabled (requires sudo)"
 }
 
 # ============================================
-# RUN INFERENCE
+# CHECK INPUT FILES (optional)
 # ============================================
 
-run_inference() {
-    print_header "Starting YOLO Inference"
+check_input_files() {
+    print_header "Checking Input Files"
     
-    # Check if run.py exists
-    if [ ! -f "run.py" ]; then
-        log_error "run.py not found in current directory"
-    fi
-    
-    log_info "Starting inference at $(date)"
-    log_info "Log file: $LOG_FILE"
-    echo ""
-    
-    # Run with python (sudo not needed for inference, only for CPU governor)
-    python run.py
-    
-    if [ $? -eq 0 ]; then
-        echo ""
-        log_success "Inference completed successfully"
+    if [ -f "best2.pt" ]; then
+        MODEL_SIZE=$(du -h best2.pt | cut -f1)
+        log_success "Model found: best2.pt ($MODEL_SIZE)"
     else
-        log_error "Inference failed"
+        log_warning "Model file 'best2.pt' not found (will need it for inference)"
+    fi
+    
+    if [ -f "test2.mp4" ]; then
+        VIDEO_SIZE=$(du -h test2.mp4 | cut -f1)
+        log_success "Video found: test2.mp4 ($VIDEO_SIZE)"
+    else
+        log_warning "Video file 'test2.mp4' not found (will need it for inference)"
     fi
 }
 
 # ============================================
-# GENERATE SUMMARY
+# PRINT USAGE INSTRUCTIONS
 # ============================================
 
-generate_summary() {
-    print_header "Setup Summary"
+print_usage() {
+    print_header "Next Steps"
     
-    echo -e "${GREEN}✓ System dependencies installed${NC}"
-    echo -e "${GREEN}✓ Virtual environment created: $ENV_NAME${NC}"
-    echo -e "${GREEN}✓ Python packages installed${NC}"
-    echo -e "${GREEN}✓ Input files verified${NC}"
-    echo -e "${GREEN}✓ Inference completed${NC}"
-    
+    echo -e "${GREEN}Installation complete!${NC}"
     echo ""
-    echo -e "${CYAN}Output files are in: research_runs/run_*/${NC}"
-    echo -e "${CYAN}Log file: $LOG_FILE${NC}"
-    
-    # Show latest run folder
-    if [ -d "research_runs" ]; then
-        LATEST_RUN=$(ls -td research_runs/run_* 2>/dev/null | head -1)
-        if [ -n "$LATEST_RUN" ]; then
-            echo -e "${GREEN}✓ Latest run: $LATEST_RUN${NC}"
-        fi
-    fi
-}
-
-# ============================================
-# CLEANUP FUNCTION
-# ============================================
-
-cleanup() {
-    log_info "Cleaning up temporary files..."
-    # Add any cleanup if needed
+    echo -e "${CYAN}To run the inference script:${NC}"
+    echo "  python run.py"
+    echo ""
+    echo -e "${CYAN}Or use the full pipeline with run directory:${NC}"
+    echo "  python run.py  # Will create research_runs/run_XXX/output_with_detections.mp4"
+    echo ""
+    echo -e "${CYAN}Check that your YOLO model and video files are in the current directory:${NC}"
+    echo "  ls -la best2.pt test2.mp4"
+    echo ""
+    echo -e "${YELLOW}Note:${NC} Make sure your Python script (run.py) is in the current directory"
+    echo -e "${YELLOW}Log file:${NC} $LOG_FILE"
 }
 
 # ============================================
@@ -342,34 +285,27 @@ main() {
     clear
     echo -e "${GREEN}"
     echo "╔══════════════════════════════════════════════════════════╗"
-    echo "║     YOLO INFERENCE PIPELINE FOR RASPBERRY PI 5          ║"
-    echo "║              Fully Automated Setup                       ║"
+    echo "║     YOLO INFERENCE - PACKAGE INSTALLER ONLY              ║"
+    echo "║         Assumes existing virtual environment              ║"
     echo "╚══════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
     
-    log "Starting automated setup at $(date)"
+    log "Starting package installation at $(date)"
     
-    # Run all steps
-    setup_sudo
+    # Run installation steps (no venv creation, no pip upgrade)
+    check_venv
     install_system_deps
-    setup_venv
     install_python_packages
-    verify_files
+    verify_installations
     check_rpi_hardware
-    run_inference
-    generate_summary
+    check_input_files
+    print_usage
     
-    log_success "All tasks completed at $(date)"
-    
-    # Deactivate virtual environment
-    deactivate 2>/dev/null
+    log_success "Package installation completed at $(date)"
 }
 
 # ============================================
-# ERROR HANDLING
+# RUN MAIN
 # ============================================
 
-trap cleanup EXIT
-
-# Run main function
 main
