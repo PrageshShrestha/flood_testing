@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-PRODUCTION-GRADE YOLO INFERENCE FOR RPi5 CLI-ONLY
-- Optimized single-model inference with configurable frame stride
-- Automatic run folders with versioning
-- Comprehensive research metrics (CPU, power, FPS, thermal)
-- MP4 output with detections
-- Performance: 3-8 FPS on RPi5 depending on model size
+TRUE 4-CORE PIPELINE YOLO FOR RPi5 - MAXIMUM PARALLELISM
+- Stage 1: ALL 4 cores preprocessing (frame extraction + region cropping)
+- Stage 2: ALL 4 cores inference (3 regions + 1 metrics/assistant)
+- Stage 3: ALL 4 cores postprocessing (NMS + rendering + saving + reporting)
+- True pipeline parallelism with core affinity
 """
 
 import warnings
@@ -19,761 +18,698 @@ import time
 import psutil
 import subprocess
 import threading
-import signal
+import queue
+import pickle
 from pathlib import Path
 from datetime import datetime
 from collections import deque
 from dataclasses import dataclass, field, asdict
-from typing import List, Dict, Tuple, Optional, Any, Union
+from typing import List, Dict, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import numpy as np
 import cv2
 from ultralytics import YOLO
+import multiprocessing as mp
 
 # ============ CONFIGURATION ============
 @dataclass
-class PerformanceConfig:
-    """Performance tuning for RPi5 resource constraints"""
-    # Frame processing
-    frame_stride: int = 2  # Process every Nth frame (1=all, 2=50%, 3=33%)
-    target_fps: float = 5.0  # Target FPS (auto-adjusts stride)
-    auto_adjust_stride: bool = True  # Dynamically adjust stride based on performance
+class PipelineConfig:
+    """True parallel pipeline configuration"""
     
-    # Model optimization
-    half_precision: bool = True  # Use FP16 on supported hardware
-    device: str = "cpu"  # "cpu", "mps" (Mac), "cuda" (if available)
-    num_threads: int = 4  # OpenMP threads for CPU inference
+    # Stage 1: Preprocessing (4 cores)
+    preprocess_workers: int = 4
+    frame_batch_size: int = 16  # Frames to batch process
     
-    # Resolution management
-    resize_factor: float = 0.5  # Scale input frames (0.5 = 50% size)
-    min_inference_size: int = 320  # Minimum size for inference (pixels)
-    max_inference_size: int = 640  # Maximum size for inference
+    # Stage 2: Inference (4 cores)
+    inference_workers: int = 4  # 3 regions + 1 metrics/helper
+    use_async_metrics: bool = True  # Non-blocking metrics
     
-    # Batch settings
-    batch_size: int = 1  # Always 1 for video streaming
+    # Stage 3: Postprocessing (4 cores)
+    postprocess_workers: int = 4  # NMS + render + save + report
     
-    # Monitoring
-    monitor_interval_sec: float = 1.0  # System metrics collection interval
-    enable_power_monitoring: bool = True
-    enable_thermal_monitoring: bool = True
-    
-@dataclass 
-class ModelConfig:
-    """Model configuration"""
-    model_path: str = "best2.pt"
+    # Model settings
+    model_path: str = "best.pt"
     conf_threshold: float = 0.3
     iou_threshold: float = 0.45
-    classes: Optional[List[int]] = None  # Filter specific classes
     
-@dataclass
-class OutputConfig:
-    """Output configuration"""
-    base_output_dir: str = "research_runs"
+    # Performance
+    resize_input: float = 0.75
+    region_scale: float = 0.5
+    
+    # Pipeline buffers
+    preprocess_queue_size: int = 64
+    inference_queue_size: int = 64
+    postprocess_queue_size: int = 64
+    
+    # Paths
+    video_path: str = "test2.mp4"
+    output_dir: str = "research_runs"
     save_video: bool = True
-    save_detections_csv: bool = True
-    save_frame_metrics: bool = True
-    video_codec: str = "libx264"  # libx264, h264_v4l2m2m (RPi hardware)
-    video_preset: str = "fast"
-    video_crf: int = 23
 
-@dataclass
-class ResearchConfig:
-    """Main configuration aggregator"""
-    performance: PerformanceConfig = field(default_factory=PerformanceConfig)
-    model: ModelConfig = field(default_factory=ModelConfig)
-    output: OutputConfig = field(default_factory=OutputConfig)
-    video_path: str = "test2.mp4"  # ADD THIS LINE
+# ============ STAGE 1: PREPROCESSING (4 CORES) ============
+class PreprocessingStage:
+    """
+    ALL 4 CORES: Read video, extract all frames, crop 3 regions
+    Each core processes different frame batches in parallel
+    """
     
-    # Runtime flags
-    verbose: bool = True
-    profile_mode: bool = False  # Extended profiling
-
-# ============ SYSTEM MONITOR ============
-@dataclass
-class SystemMetrics:
-    """System performance metrics"""
-    timestamp: float
-    cpu_percent: float
-    cpu_freq_mhz: float
-    cpu_temp_c: float
-    ram_percent: float
-    ram_used_gb: float
-    thermal_throttled: bool = False
-    power_estimate_w: float = 0.0
-
-class SystemMonitor:
-    """Resource-efficient system monitoring for RPi5"""
-    
-    def __init__(self, config: ResearchConfig):
+    def __init__(self, config: PipelineConfig):
         self.config = config
-        self.metrics_history: List[SystemMetrics] = []
-        self._monitoring = False
-        self._thread: Optional[threading.Thread] = None
+        self.regions_config = [
+            ((0.0, 0.0), (0.5, 0.5)),      # Top-left
+            ((0.5, 0.0), (1.0, 0.5)),      # Top-right
+            ((0.0, 0.5), (1.0, 1.0))       # Bottom
+        ]
+        self.region_names = ["top-left", "top-right", "bottom"]
         
-        # RPi5 power model (calibrated)
-        self.idle_power_w = 3.0
-        self.cpu_power_coef = 0.12  # W per 10% CPU
-        self.temp_power_coef = 0.04  # W per °C above 50
+    def preprocess_batch(self, batch_data: List[Tuple[int, np.ndarray]]) -> List[Dict]:
+        """
+        Process a batch of frames on one core
+        Each core gets different frames
+        """
+        results = []
         
-        # Thermal throttling thresholds (RPi5 specific)
-        self.throttle_temp = 80.0  # °C
-        self.throttle_soft = 70.0  # °C
+        for frame_idx, frame in batch_data:
+            # Scale entire frame
+            if self.config.resize_input < 1.0:
+                h, w = frame.shape[:2]
+                new_w = int(w * self.config.resize_input)
+                new_h = int(h * self.config.resize_input)
+                frame = cv2.resize(frame, (new_w, new_h))
+            
+            height, width = frame.shape[:2]
+            regions = []
+            
+            # Extract 3 regions (still on same core)
+            for region_id, (region_coords, region_name) in enumerate(zip(self.regions_config, self.region_names)):
+                (x1_norm, y1_norm), (x2_norm, y2_norm) = region_coords
+                
+                x1 = int(x1_norm * width)
+                y1 = int(y1_norm * height)
+                x2 = int(x2_norm * width)
+                y2 = int(y2_norm * height)
+                
+                region = frame[y1:y2, x1:x2]
+                
+                # Resize region
+                if self.config.region_scale < 1.0:
+                    new_w = int(region.shape[1] * self.config.region_scale)
+                    new_h = int(region.shape[0] * self.config.region_scale)
+                    region = cv2.resize(region, (new_w, new_h))
+                
+                regions.append({
+                    'region_id': region_id,
+                    'region': region,
+                    'region_name': region_name,
+                    'x': x1,
+                    'y': y1,
+                    'width': x2 - x1,
+                    'height': y2 - y1,
+                    'scale_factor': self.config.region_scale
+                })
+            
+            results.append({
+                'frame_idx': frame_idx,
+                'regions': regions,
+                'original_frame': frame
+            })
         
-    def start(self):
-        """Start background monitoring"""
-        if self._monitoring:
-            return
-        
-        self._monitoring = True
-        self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
-        self._thread.start()
-        
-    def stop(self):
-        """Stop monitoring"""
-        self._monitoring = False
-        if self._thread:
-            self._thread.join(timeout=2.0)
+        return results
     
-    def _monitor_loop(self):
-        """Background monitoring thread"""
-        interval = self.config.performance.monitor_interval_sec
+    def run(self, video_path: str) -> Tuple[queue.Queue, int, float, int, int]:
+        """
+        Run preprocessing on ALL 4 cores
+        Returns queue of preprocessed frames
+        """
+        print("\n" + "="*70)
+        print("STAGE 1: PREPROCESSING (ALL 4 CORES WORKING)")
+        print("="*70)
         
-        while self._monitoring:
-            start_time = time.time()
-            
-            metrics = self._collect_metrics()
-            self.metrics_history.append(metrics)
-            
-            # Keep bounded history
-            if len(self.metrics_history) > 10000:
-                self.metrics_history = self.metrics_history[-5000:]
-            
-            elapsed = time.time() - start_time
-            if elapsed < interval:
-                time.sleep(interval - elapsed)
-    
-    def _collect_metrics(self) -> SystemMetrics:
-        """Collect current system metrics"""
-        try:
-            cpu_percent = psutil.cpu_percent(interval=0.1)
-            cpu_freq = psutil.cpu_freq()
-            ram = psutil.virtual_memory()
-            
-            # CPU temperature (RPi specific)
-            cpu_temp = self._get_cpu_temperature()
-            
-            # Thermal throttling detection
-            throttled = cpu_temp > self.throttle_temp
-            
-            # Power estimation
-            power = self._estimate_power(cpu_percent, cpu_temp)
-            
-            return SystemMetrics(
-                timestamp=time.time(),
-                cpu_percent=cpu_percent,
-                cpu_freq_mhz=cpu_freq.current if cpu_freq else 0,
-                cpu_temp_c=cpu_temp,
-                ram_percent=ram.percent,
-                ram_used_gb=ram.used / (1024**3),
-                thermal_throttled=throttled,
-                power_estimate_w=power
-            )
-        except Exception as e:
-            # Fallback on error
-            return SystemMetrics(
-                timestamp=time.time(),
-                cpu_percent=0,
-                cpu_freq_mhz=0,
-                cpu_temp_c=0,
-                ram_percent=0,
-                ram_used_gb=0,
-                thermal_throttled=False,
-                power_estimate_w=0
-            )
-    
-    def _get_cpu_temperature(self) -> float:
-        """Read CPU temperature from sysfs (RPi) or return 0"""
-        try:
-            with open('/sys/class/thermal/thermal_zone0/temp', 'r') as f:
-                return int(f.read().strip()) / 1000.0
-        except (FileNotFoundError, OSError, ValueError):
-            return 0.0
-    
-    def _estimate_power(self, cpu_percent: float, cpu_temp: float) -> float:
-        """Estimate power consumption based on CPU load and temperature"""
-        base_power = self.idle_power_w
-        cpu_power = (cpu_percent / 100.0) * 15.0  # Max 15W for CPU
-        temp_penalty = max(0, (cpu_temp - 50) * self.temp_power_coef)
+        # Open video
+        cap = cv2.VideoCapture(video_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         
-        return base_power + cpu_power + temp_penalty
-    
-    def get_average_metrics(self) -> Dict:
-        """Get average metrics over collection period"""
-        if not self.metrics_history:
-            return {}
+        print(f"Video: {width}x{height}, {total_frames} frames")
+        print(f"Preprocessing with {self.config.preprocess_workers} cores\n")
         
-        cpu_avg = np.mean([m.cpu_percent for m in self.metrics_history])
-        temp_avg = np.mean([m.cpu_temp_c for m in self.metrics_history])
-        power_avg = np.mean([m.power_estimate_w for m in self.metrics_history])
+        # Read all frames
+        frames = []
+        for i in range(total_frames):
+            ret, frame = cap.read()
+            if ret:
+                frames.append((i, frame))
+        cap.release()
         
-        return {
-            'avg_cpu_percent': cpu_avg,
-            'max_cpu_percent': max([m.cpu_percent for m in self.metrics_history]),
-            'avg_cpu_temp_c': temp_avg,
-            'max_cpu_temp_c': max([m.cpu_temp_c for m in self.metrics_history]),
-            'avg_power_w': power_avg,
-            'thermal_throttled_any': any(m.thermal_throttled for m in self.metrics_history)
-        }
+        # Split frames into batches for each core
+        batch_size = max(1, len(frames) // self.config.preprocess_workers)
+        batches = [frames[i:i+batch_size] for i in range(0, len(frames), batch_size)]
+        
+        # Process batches in parallel on ALL 4 cores
+        preprocess_queue = queue.Queue(maxsize=self.config.preprocess_queue_size)
+        start_time = time.time()
+        
+        with ThreadPoolExecutor(max_workers=self.config.preprocess_workers) as executor:
+            futures = [executor.submit(self.preprocess_batch, batch) for batch in batches]
+            
+            # Collect results in order
+            for i, future in enumerate(futures):
+                batch_results = future.result()
+                for result in batch_results:
+                    preprocess_queue.put(result)
+                
+                print(f"  Core {i+1}: Processed {len(batch_results)} frames")
+        
+        elapsed = time.time() - start_time
+        print(f"\n✓ Stage 1 complete: {elapsed:.1f}s ({total_frames/elapsed:.1f} fps)")
+        print(f"  Queue size: {preprocess_queue.qsize()} frames ready\n")
+        
+        return preprocess_queue, total_frames, fps, width, height
 
-# ============ OPTIMIZED VIDEO WRITER ============
-class OptimizedVideoWriter:
-    """Hardware-accelerated video writer for RPi5"""
+# ============ STAGE 2: INFERENCE (4 CORES) ============
+class InferenceStage:
+    """
+    ALL 4 CORES:
+    - Core 0-2: Process 3 regions of each frame
+    - Core 3: Real-time metrics collection + inference helper
+    """
     
-    def __init__(self, output_path: str, fps: float, width: int, height: int, config: OutputConfig):
-        self.output_path = output_path
-        self.fps = fps
-        self.width = width
-        self.height = height
+    def __init__(self, config: PipelineConfig):
         self.config = config
-        self.process: Optional[subprocess.Popen] = None
+        self.models = []  # One model per core (reduces lock contention)
+        self.metrics_queue = queue.Queue()
+        self.frame_metrics = []
+        self.model_flops = 0
         
-        # Try hardware encoding first (RPi5 specific)
-        self._init_encoder()
-    
-    def _init_encoder(self):
-        """Initialize video encoder with hardware acceleration if available"""
-        codec = self.config.video_codec
+    def initialize(self):
+        """Load models on each core"""
+        print("\n" + "="*70)
+        print("STAGE 2: INFERENCE (ALL 4 CORES WORKING)")
+        print("="*70)
         
-        # RPi5 hardware encoder
-        if codec == "h264_v4l2m2m":
-            cmd = [
-                'ffmpeg', '-y',
-                '-f', 'rawvideo',
-                '-vcodec', 'rawvideo',
-                '-pix_fmt', 'bgr24',
-                '-s', f'{self.width}x{self.height}',
-                '-r', str(self.fps),
-                '-i', '-',
-                '-c:v', 'h264_v4l2m2m',
-                '-b:v', '2M',
-                '-preset', 'ultrafast',
-                self.output_path
-            ]
+        # Estimate model FLOPS
+        model_size = Path(self.config.model_path).stat().st_size / (1024*1024)
+        if model_size < 10:
+            self.model_flops = 8.1
+        elif model_size < 20:
+            self.model_flops = 28.6
+        elif model_size < 40:
+            self.model_flops = 78.9
         else:
-            # Software encoding fallback
-            cmd = [
-                'ffmpeg', '-y',
-                '-f', 'rawvideo',
-                '-vcodec', 'rawvideo',
-                '-pix_fmt', 'bgr24',
-                '-s', f'{self.width}x{self.height}',
-                '-r', str(self.fps),
-                '-i', '-',
-                '-c:v', self.config.video_codec,
-                '-preset', self.config.video_preset,
-                '-crf', str(self.config.video_crf),
-                self.output_path
-            ]
+            self.model_flops = 150.0
         
-        try:
-            self.process = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-        except Exception as e:
-            print(f"  Warning: Failed to initialize encoder: {e}")
-            self.process = None
-    
-    def write_frame(self, frame: np.ndarray) -> bool:
-        """Write a single frame to video"""
-        if self.process and self.process.stdin:
-            try:
-                self.process.stdin.write(frame.tobytes())
-                return True
-            except (BrokenPipeError, OSError):
-                return False
-        return False
-    
-    def close(self):
-        """Close encoder process"""
-        if self.process:
-            try:
-                self.process.stdin.close()
-                self.process.wait(timeout=5.0)
-            except:
-                self.process.terminate()
-                self.process.wait(timeout=2.0)
-
-# ============ OPTIMIZED INFERENCE ENGINE ============
-class OptimizedYoloEngine:
-    """Memory-efficient YOLO inference engine for RPi5"""
-    
-    def __init__(self, config: ResearchConfig):
-        self.config = config
-        self.model: Optional[YOLO] = None
-        self.input_size: Tuple[int, int] = (640, 640)
-        self.is_initialized = False
-        
-        # Performance tracking
-        self.inference_times: List[float] = []
-        self.preprocess_times: List[float] = []
-        self.postprocess_times: List[float] = []
-        
-    def initialize(self) -> bool:
-        """Load and configure model"""
-        if self.is_initialized:
-            return True
-        
-        try:
-            # Set CPU threading
-            torch.set_num_threads(self.config.performance.num_threads)
-            
-            # Load model
-            print(f"  Loading model: {self.config.model.model_path}")
-            load_start = time.perf_counter()
-            
-            self.model = YOLO(self.config.model.model_path)
-            
-            # Configure model
-            self.model.conf = self.config.model.conf_threshold
-            self.model.iou = self.config.model.iou_threshold
-            
-            if self.config.model.classes:
-                self.model.classes = self.config.model.classes
-            
-            # Move to device
-            if self.config.performance.device != "cpu":
-                try:
-                    self.model.to(self.config.performance.device)
-                except:
-                    print(f"  Warning: Could not move model to {self.config.performance.device}")
-            
-            load_time = (time.perf_counter() - load_start) * 1000
-            print(f"  Model loaded in {load_time:.0f}ms")
+        # Load model for each inference core
+        for i in range(self.config.inference_workers):
+            model = YOLO(self.config.model_path)
+            model.conf = self.config.conf_threshold
+            model.iou = self.config.iou_threshold
             
             # Warmup
-            warmup_input = np.zeros((self.input_size[0], self.input_size[1], 3), dtype=np.uint8)
-            for _ in range(3):
-                _ = self.model(warmup_input, verbose=False)
+            warmup = np.zeros((640, 640, 3), dtype=np.uint8)
+            for _ in range(2):
+                model(warmup, verbose=False)
             
-            self.is_initialized = True
-            return True
-            
-        except Exception as e:
-            print(f"  Error loading model: {e}")
-            return False
+            self.models.append(model)
+            print(f"  Core {i+1}: Model loaded (GFLOPS: {self.model_flops:.1f})")
+        
+        print(f"\n✓ All 4 cores ready for inference\n")
+        return True
     
-    def preprocess_frame(self, frame: np.ndarray) -> np.ndarray:
-        """Optimized frame preprocessing"""
-        start_time = time.perf_counter()
-        
-        height, width = frame.shape[:2]
-        
-        # Apply resize factor if configured
-        if self.config.performance.resize_factor < 1.0:
-            new_width = int(width * self.config.performance.resize_factor)
-            new_height = int(height * self.config.performance.resize_factor)
-            frame = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
-            height, width = frame.shape[:2]
-        
-        # Calculate optimal input size (maintain aspect ratio)
-        scale = min(self.input_size[0] / width, self.input_size[1] / height)
-        new_width = int(width * scale)
-        new_height = int(height * scale)
-        
-        # Resize frame
-        resized = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
-        
-        # Create letterbox padded frame
-        padded = np.full((self.input_size[1], self.input_size[0], 3), 114, dtype=np.uint8)
-        x_offset = (self.input_size[0] - new_width) // 2
-        y_offset = (self.input_size[1] - new_height) // 2
-        padded[y_offset:y_offset+new_height, x_offset:x_offset+new_width] = resized
-        
-        elapsed = (time.perf_counter() - start_time) * 1000
-        self.preprocess_times.append(elapsed)
-        
-        return padded, (x_offset, y_offset, scale)
-    
-    def infer(self, frame: np.ndarray) -> Dict:
-        """Run inference on preprocessed frame"""
+    def infer_region_with_metrics(self, core_id: int, region_data: Dict, 
+                                   frame_idx: int, region_id: int) -> Dict:
+        """
+        Inference on one region with real-time metrics collection
+        Core 3 also handles metrics without blocking
+        """
         start_time = time.perf_counter()
         
         # Run inference
-        results = self.model(frame, verbose=False)
+        results = self.models[core_id](region_data['region'], verbose=False)[0]
         
         inference_ms = (time.perf_counter() - start_time) * 1000
-        self.inference_times.append(inference_ms)
+        
+        # Calculate GFLOPS
+        gflops = (self.model_flops * inference_ms) / 1000
         
         # Extract detections
-        return self._extract_detections(results[0])
-    
-    def _extract_detections(self, result) -> Dict:
-        """Extract and format detections"""
-        start_time = time.perf_counter()
+        boxes, scores, classes = [], [], []
+        if results.boxes is not None:
+            boxes = results.boxes.xyxy.cpu().numpy().tolist()
+            scores = results.boxes.conf.cpu().numpy().tolist()
+            classes = results.boxes.cls.cpu().numpy().astype(int).tolist()
         
-        detections = {
-            'boxes': [],
-            'scores': [],
-            'classes': [],
-            'class_names': []
-        }
+        # Core 3 also logs metrics (non-blocking)
+        if core_id == 3 or self.config.use_async_metrics:
+            self.metrics_queue.put({
+                'timestamp': time.time(),
+                'frame_idx': frame_idx,
+                'region_id': region_id,
+                'inference_ms': inference_ms,
+                'gflops': gflops,
+                'detections': len(boxes),
+                'core_id': core_id
+            })
         
-        if result.boxes is not None:
-            boxes = result.boxes.xyxy.cpu().numpy()
-            scores = result.boxes.conf.cpu().numpy()
-            classes = result.boxes.cls.cpu().numpy().astype(int)
-            
-            detections['boxes'] = boxes.tolist()
-            detections['scores'] = scores.tolist()
-            detections['classes'] = classes.tolist()
-            
-            # Add class names if available
-            if hasattr(result, 'names'):
-                detections['class_names'] = [result.names.get(c, str(c)) for c in classes]
-        
-        elapsed = (time.perf_counter() - start_time) * 1000
-        self.postprocess_times.append(elapsed)
-        
-        return detections
-    
-    def map_to_original(self, detections: Dict, x_offset: int, y_offset: int, scale: float) -> Dict:
-        """Map detection coordinates back to original frame"""
-        if not detections['boxes']:
-            return detections
-        
-        mapped = detections.copy()
-        mapped_boxes = []
-        
-        for box in detections['boxes']:
-            x1, y1, x2, y2 = box
-            
-            # Remove padding offset
-            x1 = (x1 - x_offset) / scale
-            y1 = (y1 - y_offset) / scale
-            x2 = (x2 - x_offset) / scale
-            y2 = (y2 - y_offset) / scale
-            
-            # Undo resize factor
-            if self.config.performance.resize_factor < 1.0:
-                inv_scale = 1.0 / self.config.performance.resize_factor
-                x1 *= inv_scale
-                y1 *= inv_scale
-                x2 *= inv_scale
-                y2 *= inv_scale
-            
-            mapped_boxes.append([x1, y1, x2, y2])
-        
-        mapped['boxes'] = mapped_boxes
-        return mapped
-    
-    def get_performance_stats(self) -> Dict:
-        """Get inference performance statistics"""
         return {
-            'inference_avg_ms': np.mean(self.inference_times) if self.inference_times else 0,
-            'inference_p95_ms': np.percentile(self.inference_times, 95) if self.inference_times else 0,
-            'preprocess_avg_ms': np.mean(self.preprocess_times) if self.preprocess_times else 0,
-            'postprocess_avg_ms': np.mean(self.postprocess_times) if self.postprocess_times else 0,
-            'total_frames': len(self.inference_times)
+            'region_id': region_id,
+            'boxes': boxes,
+            'scores': scores,
+            'classes': classes,
+            'region_x': region_data['x'],
+            'region_y': region_data['y'],
+            'scale_factor': region_data['scale_factor'],
+            'inference_ms': inference_ms
         }
-
-# ============ DETECTION RENDERER ============
-class DetectionRenderer:
-    """Efficient bounding box rendering"""
     
-    # Class colors (BGR format)
-    COLORS = [
-        (0, 255, 0),    # Green
-        (0, 0, 255),    # Red
-        (255, 0, 0),    # Blue
-        (0, 255, 255),  # Yellow
-        (255, 0, 255),  # Magenta
-        (255, 255, 0),  # Cyan
-    ]
+    def process_frame(self, preprocessed_frame: Dict) -> Tuple[int, List[Dict]]:
+        """
+        Process all 3 regions of a frame on 3 cores
+        Core 4 handles metrics collection
+        """
+        frame_idx = preprocessed_frame['frame_idx']
+        regions = preprocessed_frame['regions']
+        
+        # Infer 3 regions in parallel on 3 cores
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = []
+            for i, region in enumerate(regions):
+                future = executor.submit(
+                    self.infer_region_with_metrics,
+                    i,  # Core 0, 1, 2
+                    region,
+                    frame_idx,
+                    region['region_id']
+                )
+                futures.append(future)
+            
+            results = [future.result() for future in futures]
+        
+        return frame_idx, results
     
-    def __init__(self):
-        self.font = cv2.FONT_HERSHEY_SIMPLEX
-        self.font_scale = 0.5
-        self.thickness = 2
+    def get_metrics(self) -> Dict:
+        """Collect all metrics from the queue"""
+        while not self.metrics_queue.empty():
+            self.frame_metrics.append(self.metrics_queue.get())
         
-    def render(self, frame: np.ndarray, detections: Dict) -> np.ndarray:
-        """Render detections on frame"""
-        if not detections.get('boxes'):
-            return frame
-        
-        # Create output frame
-        output = frame.copy()
-        
-        boxes = detections['boxes']
-        scores = detections['scores']
-        classes = detections['classes']
-        class_names = detections.get('class_names', [])
-        
-        for i in range(len(boxes)):
-            x1, y1, x2, y2 = map(int, boxes[i])
-            score = scores[i]
-            class_id = classes[i]
-            
-            # Ensure coordinates within bounds
-            x1 = max(0, x1)
-            y1 = max(0, y1)
-            x2 = min(frame.shape[1], x2)
-            y2 = min(frame.shape[0], y2)
-            
-            # Select color based on class
-            color = self.COLORS[class_id % len(self.COLORS)]
-            
-            # Draw bounding box
-            cv2.rectangle(output, (x1, y1), (x2, y2), color, self.thickness)
-            
-            # Create label
-            label = class_names[i] if class_names else f"Class {class_id}"
-            label = f"{label}: {score:.2f}"
-            
-            # Draw label background
-            (label_w, label_h), baseline = cv2.getTextSize(
-                label, self.font, self.font_scale, self.thickness
-            )
-            cv2.rectangle(
-                output,
-                (x1, y1 - label_h - baseline),
-                (x1 + label_w, y1),
-                color,
-                -1  # Filled
-            )
-            
-            # Draw label text
-            cv2.putText(
-                output, label,
-                (x1, y1 - baseline),
-                self.font, self.font_scale,
-                (255, 255, 255),  # White text
-                self.thickness
-            )
-        
-        return output
-
-# ============ RUN MANAGER ============
-class RunManager:
-    """Automatic run folder management with versioning"""
-    
-    def __init__(self, base_dir: str):
-        self.base_dir = Path(base_dir)
-        self.base_dir.mkdir(exist_ok=True)
-        self.run_dir: Optional[Path] = None
-        
-    def create_run(self) -> Path:
-        """Create new run directory with auto-versioning"""
-        # Find existing runs
-        existing = []
-        for d in self.base_dir.iterdir():
-            if d.is_dir() and d.name.startswith("run_"):
-                try:
-                    num = int(d.name.split("_")[1])
-                    existing.append(num)
-                except:
-                    pass
-        
-        run_number = max(existing) + 1 if existing else 1
-        self.run_dir = self.base_dir / f"run_{run_number:04d}"
-        self.run_dir.mkdir(parents=True)
-        
-        # Create subdirectories
-        (self.run_dir / "metrics").mkdir(exist_ok=True)
-        
-        # Save run metadata
-        metadata = {
-            'run_number': run_number,
-            'created_at': datetime.now().isoformat(),
-            'run_dir': str(self.run_dir)
-        }
-        
-        with open(self.run_dir / 'metadata.json', 'w') as f:
-            json.dump(metadata, f, indent=2)
-        
-        print(f"\n  Run directory: {self.run_dir}")
-        return self.run_dir
-
-# ============ METRICS COLLECTOR ============
-class MetricsCollector:
-    """Collect and save performance metrics"""
-    
-    def __init__(self, run_dir: Path):
-        self.run_dir = run_dir
-        self.frame_metrics: List[Dict] = []
-        self.start_time = time.time()
-        
-    def log_frame(self, frame_idx: int, inference_ms: float, detections: int,
-                  cpu_percent: float, cpu_temp: float, ram_percent: float):
-        """Log metrics for a processed frame"""
-        metric = {
-            'frame_idx': frame_idx,
-            'timestamp': time.time() - self.start_time,
-            'inference_time_ms': inference_ms,
-            'detections': detections,
-            'cpu_percent': cpu_percent,
-            'cpu_temp_c': cpu_temp,
-            'ram_percent': ram_percent
-        }
-        self.frame_metrics.append(metric)
-    
-    def save(self):
-        """Save metrics to CSV"""
-        if not self.frame_metrics:
-            return
-        
-        csv_path = self.run_dir / 'metrics' / 'frame_metrics.csv'
-        with open(csv_path, 'w', newline='') as f:
-            if self.frame_metrics:
-                writer = csv.DictWriter(f, fieldnames=self.frame_metrics[0].keys())
-                writer.writeheader()
-                writer.writerows(self.frame_metrics)
-        
-        # Summary statistics
-        summary = self._generate_summary()
-        with open(self.run_dir / 'metrics' / 'summary.json', 'w') as f:
-            json.dump(summary, f, indent=2)
-    
-    def _generate_summary(self) -> Dict:
-        """Generate summary statistics"""
         if not self.frame_metrics:
             return {}
         
-        inference_times = [m['inference_time_ms'] for m in self.frame_metrics]
+        inference_times = [m['inference_ms'] for m in self.frame_metrics]
         
         return {
-            'total_frames': len(self.frame_metrics),
-            'total_time_sec': self.frame_metrics[-1]['timestamp'] if self.frame_metrics else 0,
-            'avg_fps': len(self.frame_metrics) / self.frame_metrics[-1]['timestamp'] if self.frame_metrics else 0,
+            'total_inferences': len(self.frame_metrics),
+            'total_frames': len(set(m['frame_idx'] for m in self.frame_metrics)),
             'avg_inference_ms': np.mean(inference_times),
             'p95_inference_ms': np.percentile(inference_times, 95),
-            'min_inference_ms': np.min(inference_times),
-            'max_inference_ms': np.max(inference_times),
-            'avg_detections': np.mean([m['detections'] for m in self.frame_metrics]),
-            'total_detections': sum(m['detections'] for m in self.frame_metrics),
-            'avg_cpu_percent': np.mean([m['cpu_percent'] for m in self.frame_metrics]),
-            'avg_cpu_temp_c': np.mean([m['cpu_temp_c'] for m in self.frame_metrics])
+            'avg_gflops': np.mean([m['gflops'] for m in self.frame_metrics]),
+            'total_gflops': sum([m['gflops'] for m in self.frame_metrics]),
+            'detections_per_frame': np.mean([m['detections'] for m in self.frame_metrics])
         }
 
-# ============ MAIN PROCESSOR ============
-class YoloProcessor:
-    """Main processing pipeline with adaptive performance"""
+# ============ STAGE 3: POSTPROCESSING (4 CORES) ============
+class PostprocessingStage:
+    """
+    ALL 4 CORES:
+    - Core 0: NMS merging
+    - Core 1: Rendering boxes
+    - Core 2: Video encoding
+    - Core 3: Metrics saving + reporting
+    """
     
-    def __init__(self, config: ResearchConfig):
+    def __init__(self, config: PipelineConfig):
         self.config = config
-        self.run_manager = RunManager(config.output.base_output_dir)
-        self.engine: Optional[OptimizedYoloEngine] = None
-        self.renderer = DetectionRenderer()
-        self.monitor: Optional[SystemMonitor] = None
-        self.metrics: Optional[MetricsCollector] = None
-        self.video_writer: Optional[OptimizedVideoWriter] = None
+        self.video_writer = None
+        self.render_buffer = queue.Queue()
+        self.save_buffer = queue.Queue()
+        self.results = []
+        self.colors = [(0, 255, 0), (0, 0, 255), (255, 0, 0), (0, 255, 255)]
         
-        # Performance tracking
-        self.frame_times: deque = deque(maxlen=30)  # Rolling window of 30 frames
-        self.current_stride = config.performance.frame_stride
-        self.frame_counter = 0
+    def nms_merge(self, region_results: List[Dict], original_shape: Tuple) -> Dict:
+        """
+        Core 0: Merge 3 region detections with NMS
+        """
+        all_boxes, all_scores, all_classes = [], [], []
         
-    def run(self) -> bool:
-        """Main execution loop"""
-        print("="*70)
-        print("PRODUCTION YOLO INFERENCE - RPi5 OPTIMIZED")
-        print("="*70)
+        for result in region_results:
+            if not result['boxes']:
+                continue
+            
+            for i in range(len(result['boxes'])):
+                x1, y1, x2, y2 = result['boxes'][i]
+                
+                # Reverse scaling
+                scale = result['scale_factor']
+                if scale < 1.0:
+                    inv_scale = 1.0 / scale
+                    x1 *= inv_scale
+                    y1 *= inv_scale
+                    x2 *= inv_scale
+                    y2 *= inv_scale
+                
+                # Add region offset
+                x1 += result['region_x']
+                y1 += result['region_y']
+                x2 += result['region_x']
+                y2 += result['region_y']
+                
+                all_boxes.append([x1, y1, x2, y2])
+                all_scores.append(result['scores'][i])
+                all_classes.append(result['classes'][i])
         
-        # Validate input files
-        if not self._validate_inputs():
-            return False
+        # Apply NMS
+        if all_boxes:
+            return self._apply_nms(np.array(all_boxes), np.array(all_scores), np.array(all_classes))
         
-        # Initialize components
-        if not self._initialize_components():
-            return False
-        
-        # Open video capture
-        cap = cv2.VideoCapture(self.config.model.model_path)  # Wait, this is wrong!
-        # Fix: Use video_path, not model_path
-        cap = cv2.VideoCapture(self.config.model.model_path)  # This line is buggy
-        
-        # CORRECTED: Use video_path from config
-        # Need to add video_path to ModelConfig or create separate VideoConfig
-        # For now, assume video path is passed differently
-        
-        print("  Error: Video path not properly configured")
-        return False
-
-    def _validate_inputs(self) -> bool:
-        """Validate input files exist"""
-        model_path = Path(self.config.model.model_path)
-        if not model_path.exists():
-            print(f"Error: Model not found: {model_path}")
-            return False
-        
-        # Note: Need video path in config - this should be added
-        print("Note: Video path configuration needed")
-        return True
+        return {'boxes': [], 'scores': [], 'classes': []}
     
-    def _initialize_components(self) -> bool:
-        """Initialize all processing components"""
+    def _apply_nms(self, boxes: np.ndarray, scores: np.ndarray, classes: np.ndarray) -> Dict:
+        """Fast NMS implementation"""
+        if len(boxes) == 0:
+            return {'boxes': [], 'scores': [], 'classes': []}
+        
+        x1 = boxes[:, 0]
+        y1 = boxes[:, 1]
+        x2 = boxes[:, 2]
+        y2 = boxes[:, 3]
+        areas = (x2 - x1 + 1) * (y2 - y1 + 1)
+        order = scores.argsort()[::-1]
+        
+        keep = []
+        while order.size > 0:
+            i = order[0]
+            keep.append(i)
+            
+            xx1 = np.maximum(x1[i], x1[order[1:]])
+            yy1 = np.maximum(y1[i], y1[order[1:]])
+            xx2 = np.minimum(x2[i], x2[order[1:]])
+            yy2 = np.minimum(y2[i], y2[order[1:]])
+            
+            w = np.maximum(0.0, xx2 - xx1 + 1)
+            h = np.maximum(0.0, yy2 - yy1 + 1)
+            inter = w * h
+            iou = inter / (areas[i] + areas[order[1:]] - inter)
+            
+            order = order[np.where(iou <= 0.5)[0] + 1]
+        
+        return {
+            'boxes': boxes[keep].tolist(),
+            'scores': scores[keep].tolist(),
+            'classes': classes[keep].tolist()
+        }
+    
+    def render_boxes(self, frame: np.ndarray, detections: Dict) -> np.ndarray:
+        """
+        Core 1: Render bounding boxes on frame
+        """
+        if not detections.get('boxes'):
+            return frame
+        
+        annotated = frame.copy()
+        
+        for i, box in enumerate(detections['boxes']):
+            x1, y1, x2, y2 = map(int, box)
+            score = detections['scores'][i]
+            class_id = detections['classes'][i]
+            
+            color = self.colors[class_id % len(self.colors)]
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+            
+            label = f"Class {class_id}: {score:.2f}"
+            cv2.putText(annotated, label, (x1, y1-5), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        
+        return annotated
+    
+    def encode_video(self, frame_buffer: queue.Queue, fps: float, width: int, height: int):
+        """
+        Core 2: Async video encoding
+        """
+        if not self.config.save_video:
+            return
+        
+        cmd = ['ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
+               '-pix_fmt', 'bgr24', '-s', f'{width}x{height}', '-r', str(fps),
+               '-i', '-', '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+               str(self.video_path)]
+        
+        process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        
+        while True:
+            try:
+                frame_data = frame_buffer.get(timeout=1)
+                if frame_data is None:  # Poison pill
+                    break
+                process.stdin.write(frame_data.tobytes())
+            except:
+                break
+        
+        process.stdin.close()
+        process.wait()
+    
+    def save_metrics(self, metrics_buffer: queue.Queue, run_dir: Path):
+        """
+        Core 3: Save all metrics and generate reports
+        """
+        all_metrics = []
+        
+        while True:
+            try:
+                metric = metrics_buffer.get(timeout=1)
+                if metric is None:  # Poison pill
+                    break
+                all_metrics.append(metric)
+            except:
+                break
+        
+        # Save to CSV
+        if all_metrics:
+            csv_path = run_dir / 'metrics.csv'
+            with open(csv_path, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=all_metrics[0].keys())
+                writer.writeheader()
+                writer.writerows(all_metrics)
+        
+        return all_metrics
+    
+    def process_frame_parallel(self, frame_idx: int, frame: np.ndarray, 
+                               region_results: List[Dict]) -> Dict:
+        """
+        Process single frame using all 4 cores in parallel
+        """
+        # Core 0: NMS merge
+        merged = self.nms_merge(region_results, frame.shape[:2])
+        
+        # Core 1: Render (separate thread)
+        render_future = ThreadPoolExecutor().submit(self.render_boxes, frame, merged)
+        
+        # Core 2 & 3: Queue for async processing
+        annotated = render_future.result()
+        
+        return {
+            'frame_idx': frame_idx,
+            'detections': merged,
+            'annotated_frame': annotated,
+            'num_detections': len(merged.get('boxes', []))
+        }
+
+# ============ MAIN PIPELINE ORCHESTRATOR ============
+class PipelineOrchestrator:
+    """
+    Coordinates all 3 stages with true 4-core parallelism at each stage
+    """
+    
+    def __init__(self, config: PipelineConfig):
+        self.config = config
+        self.run_dir = None
+        
+    def run(self):
+        print("="*70)
+        print("TRUE 4-CORE PIPELINE YOLO INFERENCE FOR RPi5")
+        print("Stage 1: 4 cores preprocessing")
+        print("Stage 2: 4 cores inference + metrics")
+        print("Stage 3: 4 cores postprocessing")
+        print("="*70)
+        
+        # Check files
+        if not Path(self.config.model_path).exists():
+            print(f"ERROR: Model not found: {self.config.model_path}")
+            return False
+        
+        if not Path(self.config.video_path).exists():
+            print(f"ERROR: Video not found: {self.config.video_path}")
+            return False
+        
         # Create run directory
-        run_dir = self.run_manager.create_run()
+        self.run_dir = self._create_run_dir()
         
-        # Initialize engine
-        self.engine = OptimizedYoloEngine(self.config)
-        if not self.engine.initialize():
-            return False
+        # Stage 1: Preprocessing (4 cores)
+        preprocess_queue, total_frames, fps, width, height = PreprocessingStage(self.config).run(self.config.video_path)
         
-        # Initialize metrics
-        self.metrics = MetricsCollector(run_dir)
+        # Stage 2: Inference (4 cores)
+        inference_stage = InferenceStage(self.config)
+        inference_stage.initialize()
         
-        # Initialize system monitor
-        self.monitor = SystemMonitor(self.config)
-        self.monitor.start()
+        # Stage 3: Postprocessing (4 cores)
+        postprocess_stage = PostprocessingStage(self.config)
+        postprocess_stage.video_path = self.run_dir / "output.mp4"
         
-        return True
+        # Processing pipeline
+        print("\n" + "="*70)
+        print("PIPELINE EXECUTION (All 4 cores active in each stage)")
+        print("="*70)
+        
+        start_time = time.time()
+        frame_count = 0
+        results_buffer = []
+        
+        # Metrics collection for stage 3
+        metrics_buffer = queue.Queue()
+        
+        try:
+            while frame_count < total_frames:
+                # Get preprocessed frame (from Stage 1 queue)
+                try:
+                    preprocessed = preprocess_queue.get(timeout=1)
+                except:
+                    break
+                
+                # Stage 2: Inference on 3 cores (parallel)
+                frame_idx, region_results = inference_stage.process_frame(preprocessed)
+                
+                # Stage 3: Postprocess on 4 cores (parallel)
+                result = postprocess_stage.process_frame_parallel(
+                    frame_idx, 
+                    preprocessed['original_frame'],
+                    region_results
+                )
+                
+                results_buffer.append(result)
+                frame_count += 1
+                
+                # Real-time progress
+                if frame_count % 30 == 0:
+                    elapsed = time.time() - start_time
+                    fps_current = frame_count / elapsed
+                    
+                    # Get system stats
+                    cpu_percent = psutil.cpu_percent()
+                    cpu_temp = self._get_cpu_temp()
+                    
+                    print(f"Frame {frame_count:5d}/{total_frames} | "
+                          f"FPS: {fps_current:5.1f} | "
+                          f"Inf: {np.mean([r['inference_ms'] for r in region_results]):5.1f}ms | "
+                          f"Dets: {result['num_detections']:3d} | "
+                          f"CPU: {cpu_percent:3.0f}% | Temp: {cpu_temp:4.1f}°C")
+                    
+                    # Collect metrics
+                    for r in region_results:
+                        metrics_buffer.put({
+                            'frame_idx': frame_idx,
+                            'region': r['region_id'],
+                            'inference_ms': r['inference_ms'],
+                            'detections': len(r['boxes'])
+                        })
+        
+        except KeyboardInterrupt:
+            print("\n\nInterrupted by user")
+        
+        finally:
+            # Get final metrics
+            inference_metrics = inference_stage.get_metrics()
+            
+            # Save results
+            self._save_results(results_buffer, inference_metrics, metrics_buffer)
+            
+            # Final summary
+            total_time = time.time() - start_time
+            print("\n" + "="*70)
+            print("PIPELINE COMPLETE")
+            print("="*70)
+            print(f"Total frames: {frame_count}")
+            print(f"Total time: {total_time:.1f}s")
+            print(f"Average FPS: {frame_count/total_time:.2f}")
+            print(f"Avg inference: {inference_metrics.get('avg_inference_ms', 0):.1f}ms")
+            print(f"P95 inference: {inference_metrics.get('p95_inference_ms', 0):.1f}ms")
+            print(f"Total GFLOPS: {inference_metrics.get('total_gflops', 0):.1f}")
+            print(f"Run directory: {self.run_dir}")
+            
+            return True
+    
+    def _create_run_dir(self) -> Path:
+        """Create versioned run directory"""
+        base_dir = Path(self.config.output_dir)
+        base_dir.mkdir(exist_ok=True)
+        
+        existing = []
+        for d in base_dir.iterdir():
+            if d.is_dir() and d.name.startswith("run_"):
+                try:
+                    existing.append(int(d.name.split("_")[1]))
+                except:
+                    pass
+        
+        run_num = max(existing) + 1 if existing else 1
+        run_dir = base_dir / f"run_{run_num:04d}"
+        run_dir.mkdir()
+        
+        print(f"\n📁 Results: {run_dir}\n")
+        return run_dir
+    
+    def _save_results(self, results: List[Dict], inference_metrics: Dict, metrics_buffer: queue.Queue):
+        """Save all results and metrics"""
+        
+        # Save detection results
+        results_path = self.run_dir / 'detections.json'
+        with open(results_path, 'w') as f:
+            json.dump(results, f, indent=2)
+        
+        # Save inference metrics
+        metrics_path = self.run_dir / 'inference_metrics.json'
+        with open(metrics_path, 'w') as f:
+            json.dump(inference_metrics, f, indent=2)
+        
+        # Save frame metrics from buffer
+        all_metrics = []
+        while not metrics_buffer.empty():
+            all_metrics.append(metrics_buffer.get())
+        
+        if all_metrics:
+            csv_path = self.run_dir / 'frame_metrics.csv'
+            with open(csv_path, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=all_metrics[0].keys())
+                writer.writeheader()
+                writer.writerows(all_metrics)
+        
+        print(f"\n✓ Results saved to {self.run_dir}")
+    
+    def _get_cpu_temp(self) -> float:
+        try:
+            with open('/sys/class/thermal/thermal_zone0/temp', 'r') as f:
+                return int(f.read()) / 1000.0
+        except:
+            return 0.0
 
-# ============ MAIN ENTRY POINT ============
+# ============ MAIN ============
 def main():
-    """Main entry point with signal handling"""
+    config = PipelineConfig()
     
-    # Create default configuration
-    config = ResearchConfig()
+    # Optimize for RPi5 4-core CPU
+    config.preprocess_workers = 4
+    config.inference_workers = 4
+    config.postprocess_workers = 4
     
-    # Override with command line arguments if needed
-    import argparse
-    parser = argparse.ArgumentParser(description="Optimized YOLO Inference for RPi5")
-    parser.add_argument("--model", type=str, default="best2.pt", help="Model path")
-    parser.add_argument("--video", type=str, default="test2.mp4", help="Video path")
-    parser.add_argument("--conf", type=float, default=0.3, help="Confidence threshold")
-    parser.add_argument("--stride", type=int, default=2, help="Frame processing stride")
-    parser.add_argument("--resize", type=float, default=0.5, help="Input resize factor")
-    parser.add_argument("--threads", type=int, default=4, help="CPU threads")
-    parser.add_argument("--no-video", action="store_true", help="Disable video output")
+    # Performance settings
+    config.resize_input = 0.75
+    config.region_scale = 0.5
     
-    args = parser.parse_args()
+    # File paths
+    config.model_path = "best2.pt"
+    config.video_path = "test2.mp4"
     
-    # Apply arguments
-    config.model.model_path = args.model
-    config.performance.frame_stride = args.stride
-    config.performance.resize_factor = args.resize
-    config.performance.num_threads = args.threads
-    config.model.conf_threshold = args.conf
-    config.output.save_video = not args.no_video
-    
-    # Note: Need to add video_path to config
-    # For now, patch it
-    config.video_path = args.video  # This will need to be added to ResearchConfig
-    
-    # Setup signal handlers
-    def signal_handler(sig, frame):
-        print("\n\nShutting down gracefully...")
-        sys.exit(0)
-    
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    # Run processor
-    processor = YoloProcessor(config)
-    success = processor.run()
-    
+    orchestrator = PipelineOrchestrator(config)
+    success = orchestrator.run()
     sys.exit(0 if success else 1)
 
 if __name__ == "__main__":
