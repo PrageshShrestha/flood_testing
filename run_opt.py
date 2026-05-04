@@ -81,6 +81,7 @@ class ResearchConfig:
     performance: PerformanceConfig = field(default_factory=PerformanceConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
+    video_path: str = "test2.mp4"  # ADD THIS LINE
     
     # Runtime flags
     verbose: bool = True
