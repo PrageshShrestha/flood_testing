@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 """
-3-STAGE PIPELINE YOLO WITH 3-REGION TILING FOR RPi5
-Stage 1: 4 cores preprocessing
-Stage 2: Single model, 3 cores inference + 1 core metrics
-Stage 3: 4 cores postprocessing
-Complete per-frame metrics: timing, CPU, temp, RAM, GFLOPS, power
+3-STAGE PIPELINE YOLO WITH 3-REGION TILING FOR RPi5 - OPTIMIZED
+Fixed: deadlock recovery, resource cleanup, queue management, thread pool reuse
 """
 
 import warnings
@@ -19,12 +16,14 @@ import psutil
 import subprocess
 import threading
 import queue
+import signal
+import atexit
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
-from typing import List, Dict, Tuple, Optional
-from concurrent.futures import ThreadPoolExecutor
+from typing import List, Dict, Tuple, Optional, Any
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import numpy as np
 import cv2
 from ultralytics import YOLO
@@ -49,6 +48,14 @@ class Config:
     iou: float = 0.45
     save_video: bool = True
     
+    # Queue limits to prevent memory blowup
+    max_queue_size: int = 10
+    
+    # Timeouts in seconds
+    queue_get_timeout: float = 1.0
+    inference_timeout: float = 10.0
+    deadlock_timeout: float = 30.0
+    
     # Power estimation
     idle_power_w: float = 3.0
     cpu_power_coef: float = 0.15
@@ -61,16 +68,20 @@ class MetricsCollector:
         self.cfg = cfg
         self.frame_metrics = []
         self.model_flops = self._estimate_flops()
+        self.lock = threading.Lock()
         
     def _estimate_flops(self) -> float:
-        size_mb = Path(self.cfg.model_path).stat().st_size / (1024*1024)
-        if size_mb < 10:
-            return 8.1
-        elif size_mb < 20:
+        try:
+            size_mb = Path(self.cfg.model_path).stat().st_size / (1024*1024)
+            if size_mb < 10:
+                return 8.1
+            elif size_mb < 20:
+                return 28.6
+            elif size_mb < 40:
+                return 78.9
+            return 150.0
+        except:
             return 28.6
-        elif size_mb < 40:
-            return 78.9
-        return 150.0
     
     def _get_cpu_temp(self) -> float:
         try:
@@ -88,8 +99,8 @@ class MetricsCollector:
     def log_frame(self, frame_idx: int, stage1_ms: float, stage2_ms: float, stage3_ms: float,
                   tl_ms: float, tr_ms: float, bt_ms: float, detections: int):
         
-        cpu_percent = psutil.cpu_percent()
-        cpu_per_core = psutil.cpu_percent(percpu=True)
+        cpu_percent = psutil.cpu_percent(interval=0.1)
+        cpu_per_core = psutil.cpu_percent(percpu=True, interval=0.1)
         cpu_temp = self._get_cpu_temp()
         ram_percent = psutil.virtual_memory().percent
         ram_used_gb = psutil.virtual_memory().used / (1024**3)
@@ -125,7 +136,8 @@ class MetricsCollector:
             'total_gflops': total_gflops,
             'power_estimate_w': power_w
         }
-        self.frame_metrics.append(metric)
+        with self.lock:
+            self.frame_metrics.append(metric)
     
     def save(self):
         if not self.frame_metrics:
@@ -147,7 +159,7 @@ class MetricsCollector:
         
         total_frames = len(self.frame_metrics)
         total_time = self.frame_metrics[-1]['timestamp'] - self.frame_metrics[0]['timestamp']
-        avg_fps = total_frames / total_time
+        avg_fps = total_frames / total_time if total_time > 0 else 0
         
         avg_inference = np.mean([m['stage2_inference_ms'] for m in self.frame_metrics])
         p95_inference = np.percentile([m['stage2_inference_ms'] for m in self.frame_metrics], 95)
@@ -206,13 +218,13 @@ class MetricsCollector:
         txt_path = self.run_dir / 'research_report.txt'
         with open(txt_path, 'w') as f:
             f.write("="*70 + "\n")
-            f.write("RESEARCH REPORT - 3-STAGE PIPELINE\n")
+            f.write("RESEARCH REPORT - 3-STAGE PIPELINE (OPTIMIZED)\n")
             f.write("="*70 + "\n\n")
             
             f.write("RUN INFORMATION\n")
             f.write("-"*40 + "\n")
             f.write(f"Run Dir: {self.run_dir}\n")
-            f.write(f"Model: {self.cfg.model_path}\n")
+            f.write(f"Model: {self.cfg.model_path}\n)
             f.write(f"Video: {self.cfg.video_path}\n")
             f.write(f"Model GFLOPS: {self.model_flops:.1f}\n\n")
             
@@ -243,12 +255,13 @@ class MetricsCollector:
             f.write(f"Top-Right: {report['region_breakdown']['tr_avg_ms']:.1f}ms\n")
             f.write(f"Bottom: {report['region_breakdown']['bt_avg_ms']:.1f}ms\n")
         
-        print(f"\nSaved: {txt_path}")
+        print(f"\n✅ Saved: {txt_path}")
 
 # ============ STAGE 1 ============
 class Stage1:
     def __init__(self, cfg: Config):
         self.cfg = cfg
+        self.executor = None
         
     def run(self, video_path: str):
         print("\n[STAGE1] PREPROCESSING (4 cores)")
@@ -269,46 +282,73 @@ class Stage1:
                 frames.append((i, frame))
         cap.release()
         
+        # Use bounded queue
+        out_queue = queue.Queue(maxsize=self.cfg.max_queue_size)
+        
         start = time.time()
-        q = queue.Queue()
+        
+        # Reusable executor
+        self.executor = ThreadPoolExecutor(max_workers=4)
         
         def process_frame(frame_data):
             idx, frame = frame_data
             t0 = time.perf_counter()
             
-            if self.cfg.resize_input < 1.0:
+            try:
+                if self.cfg.resize_input < 1.0:
+                    h, w = frame.shape[:2]
+                    frame = cv2.resize(frame, (int(w*self.cfg.resize_input), int(h*self.cfg.resize_input)))
+                
                 h, w = frame.shape[:2]
-                frame = cv2.resize(frame, (int(w*self.cfg.resize_input), int(h*self.cfg.resize_input)))
-            
-            h, w = frame.shape[:2]
-            regions = []
-            
-            for rid, (coords, name) in enumerate(zip(self.cfg.regions, self.cfg.region_names)):
-                (x1n, y1n), (x2n, y2n) = coords
-                x1, y1 = int(x1n*w), int(y1n*h)
-                x2, y2 = int(x2n*w), int(y2n*h)
-                region = frame[y1:y2, x1:x2]
+                regions = []
                 
-                if self.cfg.region_scale < 1.0:
-                    region = cv2.resize(region, (int(region.shape[1]*self.cfg.region_scale), 
-                                                  int(region.shape[0]*self.cfg.region_scale)))
+                for rid, (coords, name) in enumerate(zip(self.cfg.regions, self.cfg.region_names)):
+                    (x1n, y1n), (x2n, y2n) = coords
+                    x1, y1 = int(x1n*w), int(y1n*h)
+                    x2, y2 = int(x2n*w), int(y2n*h)
+                    region = frame[y1:y2, x1:x2]
+                    
+                    if self.cfg.region_scale < 1.0:
+                        region = cv2.resize(region, (int(region.shape[1]*self.cfg.region_scale), 
+                                                      int(region.shape[0]*self.cfg.region_scale)))
+                    
+                    regions.append({
+                        'rid': rid, 'name': name, 'data': region,
+                        'x': x1, 'y': y1, 'scale': self.cfg.region_scale
+                    })
                 
-                regions.append({
-                    'rid': rid, 'name': name, 'data': region,
-                    'x': x1, 'y': y1, 'scale': self.cfg.region_scale
-                })
-            
-            q.put({
-                'idx': idx, 'regions': regions, 'frame': frame,
-                'size': (w, h), 'preprocess_ms': (time.perf_counter()-t0)*1000
-            })
+                preprocess_ms = (time.perf_counter()-t0)*1000
+                
+                # Put with timeout to avoid blocking
+                out_queue.put({
+                    'idx': idx, 'regions': regions, 'frame': frame,
+                    'size': (w, h), 'preprocess_ms': preprocess_ms
+                }, timeout=5.0)
+                
+            except Exception as e:
+                print(f"  Error processing frame {idx}: {e}")
         
-        with ThreadPoolExecutor(max_workers=4) as ex:
-            ex.map(process_frame, frames)
+        # Submit all tasks
+        futures = [self.executor.submit(process_frame, fd) for fd in frames]
+        
+        # Wait for completion with timeout
+        for future in futures:
+            try:
+                future.result(timeout=30.0)
+            except Exception as e:
+                print(f"  Task failed: {e}")
         
         elapsed = time.time() - start
         print(f"Done: {elapsed:.2f}s ({total/elapsed:.1f}fps)")
-        return q, total, fps, width, height
+        
+        # Send stop signal
+        out_queue.put(None)
+        
+        return out_queue, total, fps, width, height
+    
+    def cleanup(self):
+        if self.executor:
+            self.executor.shutdown(wait=True, cancel_futures=True)
 
 # ============ STAGE 2 ============
 class Stage2:
@@ -316,6 +356,8 @@ class Stage2:
         self.cfg = cfg
         self.model = None
         self.gflops = 0
+        self.executor = None  # Reusable executor
+        self.running = True
         
     def load_model(self):
         print("\n[STAGE2] LOADING MODEL")
@@ -325,6 +367,7 @@ class Stage2:
         self.model.conf = self.cfg.conf
         self.model.iou = self.cfg.iou
         
+        # Warmup
         warm = np.zeros((640,640,3), dtype=np.uint8)
         for _ in range(3):
             self.model(warm, verbose=False)
@@ -339,74 +382,127 @@ class Stage2:
         else:
             self.gflops = 150.0
         
+        # Create reusable thread pool for region inference
+        self.executor = ThreadPoolExecutor(max_workers=3)
+        
         print(f"Loaded: {time.time()-t0:.2f}s, {self.gflops:.1f}GFLOPS")
     
     def infer_region(self, region, name, idx):
+        """Single region inference with timeout"""
         t0 = time.perf_counter()
-        results = self.model(region, verbose=False)[0]
-        inf_ms = (time.perf_counter() - t0) * 1000
-        
-        boxes, scores, classes = [], [], []
-        if results.boxes is not None:
-            boxes = results.boxes.xyxy.cpu().numpy().tolist()
-            scores = results.boxes.conf.cpu().numpy().tolist()
-            classes = results.boxes.cls.cpu().numpy().astype(int).tolist()
-        
-        return {'name': name, 'boxes': boxes, 'scores': scores, 'classes': classes,
-                'inf_ms': inf_ms, 'detections': len(boxes)}
+        try:
+            results = self.model(region, verbose=False)[0]
+            inf_ms = (time.perf_counter() - t0) * 1000
+            
+            boxes, scores, classes = [], [], []
+            if results.boxes is not None:
+                boxes = results.boxes.xyxy.cpu().numpy().tolist()
+                scores = results.boxes.conf.cpu().numpy().tolist()
+                classes = results.boxes.cls.cpu().numpy().astype(int).tolist()
+            
+            return {'name': name, 'boxes': boxes, 'scores': scores, 'classes': classes,
+                    'inf_ms': inf_ms, 'detections': len(boxes)}
+        except Exception as e:
+            print(f"  Inference error on {name}: {e}")
+            return {'name': name, 'boxes': [], 'scores': [], 'classes': [],
+                    'inf_ms': (time.perf_counter() - t0) * 1000, 'detections': 0}
     
     def run(self, in_queue: queue.Queue):
         print("\n[STAGE2] INFERENCE (3 cores)")
         print("-"*50)
         
-        out_queue = queue.Queue()
+        out_queue = queue.Queue(maxsize=self.cfg.max_queue_size)
         start = time.time()
         processed = 0
+        failed_frames = 0
+        last_progress_time = time.time()
         
-        while True:
+        while self.running:
             try:
-                prepped = in_queue.get(timeout=0.5)
-                if prepped is None:
+                prepped = in_queue.get(timeout=self.cfg.queue_get_timeout)
+                if prepped is None:  # Stop signal
                     break
                 
                 regions = prepped['regions']
                 t0 = time.perf_counter()
                 
-                with ThreadPoolExecutor(max_workers=3) as ex:
-                    futures = []
-                    for r in regions:
-                        futures.append(ex.submit(self.infer_region, r['data'], r['name'], prepped['idx']))
-                    results = [f.result() for f in futures]
+                # Submit all region inferences in parallel using reusable executor
+                futures = []
+                for r in regions:
+                    future = self.executor.submit(self.infer_region, r['data'], r['name'], prepped['idx'])
+                    futures.append(future)
+                
+                # Collect results with timeout
+                results = []
+                for future in futures:
+                    try:
+                        result = future.result(timeout=self.cfg.inference_timeout)
+                        results.append(result)
+                    except FutureTimeoutError:
+                        print(f"  Timeout on frame {prepped['idx']} region inference")
+                        failed_frames += 1
+                        results.append({'name': 'timeout', 'boxes': [], 'scores': [], 
+                                      'classes': [], 'inf_ms': self.cfg.inference_timeout*1000, 'detections': 0})
                 
                 inf_ms = (time.perf_counter() - t0) * 1000
+                
+                # Extract per-region times
+                tl_ms = results[0]['inf_ms'] if len(results) > 0 else 0
+                tr_ms = results[1]['inf_ms'] if len(results) > 1 else 0
+                bt_ms = results[2]['inf_ms'] if len(results) > 2 else 0
                 
                 out_queue.put({
                     'idx': prepped['idx'],
                     'frame': prepped['frame'],
                     'size': prepped['size'],
+                    'preprocess_ms': prepped.get('preprocess_ms', 0),
                     'results': results,
                     'inference_ms': inf_ms,
-                    'tl_ms': results[0]['inf_ms'],
-                    'tr_ms': results[1]['inf_ms'],
-                    'bt_ms': results[2]['inf_ms']
-                })
+                    'tl_ms': tl_ms,
+                    'tr_ms': tr_ms,
+                    'bt_ms': bt_ms
+                }, timeout=5.0)
                 
                 processed += 1
-                if processed % 50 == 0:
+                
+                # Progress reporting
+                if processed % 25 == 0:
                     elapsed = time.time() - start
-                    print(f"  Frame {processed}: {processed/elapsed:.1f}fps")
-                    
+                    fps = processed / elapsed if elapsed > 0 else 0
+                    print(f"  Stage2: {processed} frames, {fps:.1f}fps, queue: {in_queue.qsize()}")
+                    last_progress_time = time.time()
+                
             except queue.Empty:
+                # Check for deadlock
+                if time.time() - last_progress_time > self.cfg.deadlock_timeout:
+                    if in_queue.empty() and processed > 0:
+                        print(f"  Deadlock detected - forcing stop")
+                        break
+                continue
+            except Exception as e:
+                print(f"  Stage2 error: {e}")
+                failed_frames += 1
                 continue
         
         elapsed = time.time() - start
-        print(f"Done: {elapsed:.2f}s ({processed/elapsed:.1f}fps)")
+        print(f"Done: {elapsed:.2f}s ({processed/elapsed:.1f}fps), failed: {failed_frames}")
+        
+        # Send stop signal
+        out_queue.put(None)
+        
         return out_queue
+    
+    def cleanup(self):
+        self.running = False
+        if self.executor:
+            self.executor.shutdown(wait=True, cancel_futures=True)
 
 # ============ STAGE 3 ============
 class Stage3:
     def __init__(self, cfg: Config):
         self.cfg = cfg
+        self.running = True
+        self.video_process = None
         
     def nms(self, boxes, scores, thresh=0.5):
         if len(boxes) == 0:
@@ -443,23 +539,29 @@ class Stage3:
         print("-"*50)
         
         # Video writer
-        video_process = None
         if self.cfg.save_video:
             video_path = run_dir / 'output.mp4'
             cmd = ['ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
                    '-pix_fmt', 'bgr24', '-s', f'{width}x{height}', '-r', str(fps),
                    '-i', '-', '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
                    str(video_path)]
-            video_process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            try:
+                self.video_process = subprocess.Popen(cmd, stdin=subprocess.PIPE, 
+                                                      stderr=subprocess.DEVNULL)
+            except Exception as e:
+                print(f"  FFmpeg error: {e}")
+                self.cfg.save_video = False
         
         start = time.time()
         processed = 0
         frame_results = []
+        last_progress_time = time.time()
+        expected_frames = None
         
-        while True:
+        while self.running:
             try:
-                data = in_queue.get(timeout=0.5)
-                if data is None:
+                data = in_queue.get(timeout=self.cfg.queue_get_timeout)
+                if data is None:  # Stop signal
                     break
                 
                 t0 = time.perf_counter()
@@ -471,10 +573,6 @@ class Stage3:
                         continue
                     for i in range(len(res['boxes'])):
                         x1, y1, x2, y2 = res['boxes'][i]
-                        # Scale back
-                        if data['size'][0] > 0:
-                            # Regions were already at final size, coordinates are correct
-                            pass
                         all_boxes.append([x1, y1, x2, y2])
                         all_scores.append(res['scores'][i])
                         all_classes.append(res['classes'][i])
@@ -501,8 +599,12 @@ class Stage3:
                 post_ms = (time.perf_counter() - t0) * 1000
                 
                 # Write video
-                if video_process:
-                    video_process.stdin.write(annotated.tobytes())
+                if self.cfg.save_video and self.video_process:
+                    try:
+                        self.video_process.stdin.write(annotated.tobytes())
+                    except BrokenPipeError:
+                        print("  Video pipe broken")
+                        self.cfg.save_video = False
                 
                 # Log metrics
                 metrics.log_frame(
@@ -525,17 +627,32 @@ class Stage3:
                 })
                 
                 processed += 1
-                if processed % 50 == 0:
+                
+                # Progress reporting
+                if processed % 25 == 0:
                     elapsed = time.time() - start
-                    print(f"  Frame {processed}: post={post_ms:.1f}ms, {processed/elapsed:.1f}fps")
-                    
+                    fps_proc = processed / elapsed if elapsed > 0 else 0
+                    print(f"  Stage3: {processed} frames, {fps_proc:.1f}fps, queue: {in_queue.qsize()}")
+                    last_progress_time = time.time()
+                
             except queue.Empty:
+                # Check for deadlock
+                if time.time() - last_progress_time > self.cfg.deadlock_timeout:
+                    if in_queue.empty() and processed > 0:
+                        print(f"  Deadlock detected - forcing stop")
+                        break
+                continue
+            except Exception as e:
+                print(f"  Stage3 error: {e}")
                 continue
         
-        # Cleanup
-        if video_process:
-            video_process.stdin.close()
-            video_process.wait()
+        # Cleanup video writer
+        if self.video_process:
+            try:
+                self.video_process.stdin.close()
+                self.video_process.wait(timeout=5.0)
+            except:
+                self.video_process.kill()
         
         # Save detections
         with open(run_dir / 'detections.json', 'w') as f:
@@ -544,58 +661,117 @@ class Stage3:
         elapsed = time.time() - start
         print(f"Done: {elapsed:.2f}s ({processed/elapsed:.1f}fps)")
         return frame_results
+    
+    def cleanup(self):
+        self.running = False
+        if self.video_process:
+            try:
+                self.video_process.stdin.close()
+                self.video_process.terminate()
+                self.video_process.wait(timeout=2.0)
+            except:
+                self.video_process.kill()
 
-# ============ MAIN ============
+# ============ MAIN WITH SIGNAL HANDLING ============
+class Pipeline:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.stage1 = None
+        self.stage2 = None
+        self.stage3 = None
+        self.metrics = None
+        self.run_dir = None
+        
+    def signal_handler(self, sig, frame):
+        print(f"\n⚠️  Signal {sig} received - cleaning up...")
+        self.cleanup()
+        sys.exit(1)
+    
+    def cleanup(self):
+        print("Cleaning up resources...")
+        if self.stage1:
+            self.stage1.cleanup()
+        if self.stage2:
+            self.stage2.cleanup()
+        if self.stage3:
+            self.stage3.cleanup()
+    
+    def run(self):
+        # Setup signal handlers
+        signal.signal(signal.SIGINT, self.signal_handler)
+        signal.signal(signal.SIGTERM, self.signal_handler)
+        
+        # Check files
+        if not Path(self.cfg.model_path).exists():
+            print(f"ERROR: {self.cfg.model_path} not found")
+            return 1
+        if not Path(self.cfg.video_path).exists():
+            print(f"ERROR: {self.cfg.video_path} not found")
+            return 1
+        
+        # Create run directory
+        run_dir = Path(self.cfg.output_dir)
+        run_dir.mkdir(exist_ok=True)
+        existing = [int(d.name.split('_')[1]) for d in run_dir.iterdir() 
+                    if d.is_dir() and d.name.startswith('run_')]
+        run_num = max(existing) + 1 if existing else 1
+        self.run_dir = run_dir / f'run_{run_num:04d}'
+        self.run_dir.mkdir()
+        print(f"\n📍 RUN: {self.run_dir}")
+        
+        # Save config
+        with open(self.run_dir / 'config.json', 'w') as f:
+            json.dump(asdict(self.cfg), f, indent=2)
+        
+        # Initialize components
+        self.metrics = MetricsCollector(self.run_dir, self.cfg)
+        self.stage1 = Stage1(self.cfg)
+        self.stage2 = Stage2(self.cfg)
+        self.stage3 = Stage3(self.cfg)
+        
+        # Load model
+        self.stage2.load_model()
+        
+        # Run pipeline
+        try:
+            q1, total, fps, w, h = self.stage1.run(self.cfg.video_path)
+            print(f"\n✅ Stage1 complete, {total} frames preprocessed")
+            
+            q2 = self.stage2.run(q1)
+            print(f"✅ Stage2 complete")
+            
+            results = self.stage3.run(q2, fps, w, h, self.run_dir, self.metrics)
+            print(f"✅ Stage3 complete")
+            
+            # Save metrics
+            self.metrics.save()
+            
+            # Summary
+            print("\n" + "="*70)
+            print("SUMMARY")
+            print("="*70)
+            print(f"Total Frames:  {total}")
+            print(f"Processed:     {len(results)}")
+            if self.metrics.frame_metrics:
+                total_time = self.metrics.frame_metrics[-1]['timestamp'] - self.metrics.frame_metrics[0]['timestamp']
+                print(f"FPS:           {len(results) / total_time if total_time > 0 else 0:.2f}")
+            print(f"Output:        {self.run_dir}")
+            print("="*70)
+            
+        except Exception as e:
+            print(f"\n❌ Pipeline error: {e}")
+            import traceback
+            traceback.print_exc()
+            return 1
+        finally:
+            self.cleanup()
+        
+        return 0
+
 def main():
     cfg = Config()
-    
-    # Check files
-    if not Path(cfg.model_path).exists():
-        print(f"ERROR: {cfg.model_path} not found")
-        return 1
-    if not Path(cfg.video_path).exists():
-        print(f"ERROR: {cfg.video_path} not found")
-        return 1
-    
-    # Run directory
-    run_dir = Path(cfg.output_dir)
-    run_dir.mkdir(exist_ok=True)
-    existing = [int(d.name.split('_')[1]) for d in run_dir.iterdir() 
-                if d.is_dir() and d.name.startswith('run_')]
-    run_num = max(existing) + 1 if existing else 1
-    run_dir = run_dir / f'run_{run_num:04d}'
-    run_dir.mkdir()
-    print(f"\nRUN: {run_dir}")
-    
-    # Save config
-    with open(run_dir / 'config.json', 'w') as f:
-        json.dump(asdict(cfg), f, indent=2)
-    
-    # Initialize
-    metrics = MetricsCollector(run_dir, cfg)
-    s1 = Stage1(cfg)
-    s2 = Stage2(cfg)
-    s2.load_model()
-    s3 = Stage3(cfg)
-    
-    # Run pipeline
-    q1, total, fps, w, h = s1.run(cfg.video_path)
-    q2 = s2.run(q1)
-    results = s3.run(q2, fps, w, h, run_dir, metrics)
-    
-    # Save metrics
-    metrics.save()
-    
-    # Summary
-    print("\n" + "="*70)
-    print("SUMMARY")
-    print("="*70)
-    print(f"Frames:     {total}")
-    print(f"Processed:  {len(results)}")
-    print(f"FPS:        {len(results) / metrics.frame_metrics[-1]['timestamp'] if metrics.frame_metrics else 0:.2f}")
-    print(f"Output:     {run_dir}")
-    
-    return 0
+    pipeline = Pipeline(cfg)
+    return pipeline.run()
 
 if __name__ == "__main__":
     sys.exit(main())
