@@ -1,8 +1,9 @@
 # Raw Wi-Fi Monitor-Mode Video Link — Full Command Reference
 
 A step-by-step reference for building a WFB-ng-style air-to-ground video link using
-monitor mode + GStreamer + Python + C++ raw sockets. This is the manual/DIY approach
-that gets you close to WFB-ng performance without the full WFB-ng stack.
+monitor mode + GStreamer + a Python (Scapy) injection/reception script. This is the
+manual/DIY approach — it will **not** match WFB-ng's latency, reliability, or range
+without the caveats noted at the end.
 
 ---
 
@@ -18,8 +19,7 @@ Install dependencies on **both** units:
 ```bash
 sudo apt update
 sudo apt install -y python3-scapy gstreamer1.0-tools gstreamer1.0-plugins-good \
-    gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly aircrack-ng iw \
-    build-essential libpcap-dev python3-pip
+    gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly aircrack-ng iw
 ```
 
 `aircrack-ng` gives you `airmon-ng`, which is the easiest way to manage monitor mode.
@@ -44,8 +44,8 @@ sudo ip link set wlan0 up
 sudo iw wlan0 set channel 149
 ```
 
-Channel 149 is in the 5GHz band and commonly used for FPV because it's less congested.
-Use `iw list` to see what channels/bands your adapter supports.
+> Channel 149 is in the 5GHz band and commonly used for FPV because it's less congested.
+> Use `iw list` to see what channels/bands your adapter supports.
 
 ### Option B — using `airmon-ng` (kills interfering processes automatically)
 
@@ -91,9 +91,9 @@ sudo systemctl restart NetworkManager
 
 ---
 
-## 3. The Air Unit — Transmitter Script (Python/Scapy version)
+## 3. The Air Unit — Transmitter Script (`tx.py`)
 
-Save on the **air** unit as `tx.py`:
+Save on the **air** unit:
 
 ```python
 import sys
@@ -146,9 +146,9 @@ echo "Hello Ground" | python3 tx.py
 
 ---
 
-## 4. The Ground Unit — Receiver Script (Python/Scapy version)
+## 4. The Ground Unit — Receiver Script (`rx.py`)
 
-Save on the **ground** unit as `rx.py`:
+Save on the **ground** unit:
 
 ```python
 import sys
@@ -184,7 +184,7 @@ python3 rx.py | gst-launch-1.0 fdsrc ! tee name=t \
 
 ---
 
-## 5. Full Startup Sequence (Both Ends) — Python Version
+## 5. Full Startup Sequence (Both Ends)
 
 **On the Air unit:**
 
@@ -206,8 +206,6 @@ sudo iw wlan0mon set channel 149
 python3 rx.py | gst-launch-1.0 fdsrc ! h264parse ! avdec_h264 \
     ! videoconvert ! autovideosink
 ```
-
----
 
 ## 6. Full Shutdown Sequence (Both Ends)
 
@@ -241,15 +239,15 @@ iw list
 
 ---
 
-## 8. Why Python/Scapy Won't Match WFB-ng — and How to Close the Gap
+## 8. Why This Won't Match WFB-ng — and How to Close the Gap
 
-| Feature | Python/Scapy | WFB-ng / OpenHD |
+| Feature | This DIY script | WFB-ng / OpenHD |
 |---|---|---|
-| FEC (Forward Error Correction) | None — video breaks on interference | Reconstructs lost packets |
-| Encryption | None | AES-encrypted |
-| Multi-card RX diversity | Not supported | Combines multiple antennas |
-| Telemetry muxing (MAVLink) | Needs separate link | Muxed with video |
-| Processing speed | Python/Scapy too slow for 30-60fps sustained | Optimized C |
+| FEC (Forward Error Correction) | ❌ None — video breaks on interference | ✅ Reconstructs lost packets |
+| Encryption | ❌ None | ✅ AES-encrypted |
+| Multi-card RX diversity | ❌ Not supported | ✅ Combines multiple antennas |
+| Telemetry muxing (MAVLink) | ❌ Needs separate link | ✅ Muxed with video |
+| Processing speed | ❌ Python/Scapy too slow for 30-60fps sustained | ✅ Optimized C |
 
 To actually approach WFB-ng-level performance you'd need to:
 
@@ -261,8 +259,9 @@ To actually approach WFB-ng-level performance you'd need to:
 4. **Add multi-card RX diversity** — listen on multiple monitor-mode interfaces
    simultaneously and merge/deduplicate frames.
 
----
-
+If you want, I can put together the alternative install/setup commands for
+**OpenHD** or **Ruby FPV** instead, since both give you this feature set out of the box
+without writing any custom code.
 ## 9. C++ Version (Raw Sockets — Much Faster Than Python/Scapy)
 
 This replaces `tx.py`/`rx.py`. It uses `AF_PACKET`/`SOCK_RAW` directly, avoiding Scapy's
@@ -457,8 +456,8 @@ sudo ./rx | gst-launch-1.0 fdsrc ! h264parse ! avdec_h264 \
     ! videoconvert ! autovideosink
 ```
 
-Both `tx` and `rx` need `sudo` (or `setcap cap_net_raw+ep ./tx`) since raw sockets
-require `CAP_NET_RAW`.
+> Both `tx` and `rx` need `sudo` (or `setcap cap_net_raw+ep ./tx`) since raw sockets
+> require `CAP_NET_RAW`.
 
 ### Why this is faster
 
@@ -478,890 +477,217 @@ require `CAP_NET_RAW`.
 - **Adaptive bitrate / packet size tuning**: match your MTU-per-injection to what your
   driver/chipset handles best (some drivers fragment or drop oversized raw frames).
 
----
+## 10. Combining Both: SAR Streamer (Air) + Raw Monitor-Mode Link (Ground)
 
-## 10. SAR-Streamer-Style Air/Ground Pair (Raw Radio Link, No ffmpeg/RTSP)
+This section wires your SAR streamer (camera capture, throttled detection,
+decoupled telemetry) into the raw monitor-mode pipeline from sections 3–9,
+instead of its original RTSP output. Full file: `air_unit.py`.
 
-`air_unit.py` and `ground_unit.py` reproduce the SAR streamer's architecture
-(decoupled telemetry thread, throttled/cached detection, background uplink
-queue) but replace the ffmpeg/RTSP transport with the raw monitor-mode
-802.11 injection built earlier. No Scapy in the hot path — both scripts use
-`socket.AF_PACKET`/`SOCK_RAW` directly.
+**What changed vs. the original SAR streamer:**
 
-Install deps on both machines:
-
-```bash
-pip install opencv-python numpy
-pip install pyserial pynmea2   # optional, only needed for real GPS
-pip install ultralytics        # optional, only needed for --detect (YOLO); falls back to HOG if absent
-```
-
-### Air unit (drone / companion computer)
-
-```bash
-# 1. Monitor mode
-sudo airmon-ng check kill
-sudo airmon-ng start wlan0
-sudo iw wlan0mon set channel 149
-
-# 2. Run with a live camera
-sudo python3 air_unit.py --iface wlan0mon --camera 0 --width 640 --height 480 --fps 30
-
-# 2b. Or bench-test with a video file, no camera needed
-sudo python3 air_unit.py --iface wlan0mon --input test2.mp4 --loop
-
-# With real GPS attached:
-sudo python3 air_unit.py --iface wlan0mon --camera 0 --gps_port /dev/serial0
-```
-
-### Ground unit (laptop)
-
-```bash
-# 1. Monitor mode (same channel as air unit)
-sudo airmon-ng check kill
-sudo airmon-ng start wlan0
-sudo iw wlan0mon set channel 149
-
-# 2. Plain video + telemetry overlay, no detection
-sudo python3 ground_unit.py --iface wlan0mon
-
-# 3. With human detection (throttled every 3rd frame by default)
-sudo python3 ground_unit.py --iface wlan0mon --detect
-
-# 4. Headless (e.g. running on a Pi ground station with no monitor)
-sudo python3 ground_unit.py --iface wlan0mon --detect --no-display
-
-# 5. With detections pushed to a dashboard
-sudo python3 ground_unit.py --iface wlan0mon --detect --telemetry_url http://localhost:8765
-```
-
-### Shutdown (both ends)
-
-```bash
-# Ctrl+C the running script, then:
-sudo airmon-ng stop wlan0mon
-sudo systemctl restart NetworkManager
-```
-
-### What's different from the SAR streamer's ffmpeg/RTSP version
-
-| | ffmpeg/RTSP version | This raw-radio version |
+| | Original (RTSP) | This version (raw link) |
 |---|---|---|
-| Transport | ffmpeg -> RTSP over normal IP networking | Raw 802.11 frames, no IP stack at all |
-| Requires an AP/router | Yes (or direct link config) | No — point-to-point, monitor mode only |
-| Packet loss handling | TCP/RTSP handles it | None yet (occasional corrupt JPEG frames get silently dropped — see `cv2.imdecode` returning `None`) |
-| Latency | ffmpeg encode/mux/RTSP overhead | Lower — JPEG chunks go straight to the radio |
-| Range/interference behavior | Same as any Wi-Fi client link | Same broadcast-style behavior as WFB-ng, minus its FEC |
-
-### Known gap vs. the earlier C++/WFB-ng discussion
-
-This pair still has **no FEC**, so a lost chunk drops the *whole* JPEG frame
-(you'll see an occasional skipped/frozen frame rather than a corrupted one —
-`ground_unit.py`'s `cv2.imdecode` check protects against garbled JPEGs, it
-just can't recover them). If you want to close that gap next, the highest-value
-addition is Reed-Solomon FEC per frame (e.g. `zfec`), applied the same way
-WFB-ng blocks N data + K parity packets — happy to add that as a `--fec`
-option in `air_unit.py`/`ground_unit.py` if useful.
-
----
-
-## 11. Air Unit — Full Script (`air_unit.py`)
-
-This is the complete air unit script that includes:
-- Video capture from file or camera
-- Optional human detection (YOLO or HOG fallback)
-- Background telemetry reader (GPS, CPU temp, battery)
-- Uplink queue for detection snapshots (over separate IP)
-- Raw 802.11 injection via `tx` binary
-
-```python
-#!/usr/bin/env python3
-"""
-Air Unit — SAR Streamer over raw monitor-mode Wi-Fi
-=====================================================
-Same detection/telemetry architecture as the RTSP version (throttled
-detection, decoupled background telemetry, non-blocking uplink), but the
-OUTPUT SINK is different: instead of pushing to an RTSP server over normal
-IP networking, this pipes H.264 bytes straight into the `tx` raw-socket
-injector, which puts them on the air in monitor mode (WFB-ng style).
-
-Pipeline:
-    [cv2 capture + overlay/detection] -> [ffmpeg: rawvideo -> H.264] -> [tx: raw 802.11 injection]
-
-Two subprocesses are chained:
-    ffmpeg.stdin  <- frame bytes written by this script (same as before)
-    ffmpeg.stdout -> tx.stdin (raw H.264 elementary stream)
-
-Usage (unchanged flags from the RTSP version, minus --rtsp_url):
-    python3 air_unit.py --input test2.mp4
-    python3 air_unit.py --input test2.mp4 --detect --no-display
-    python3 air_unit.py --input test2.mp4 --detect --telemetry_url http://localhost:8765
-    python3 air_unit.py --iface wlan0mon --bitrate 2000
-"""
-
-import subprocess
-import cv2
-import time
-import sys
-import signal
-import argparse
-import json
-import io
-import threading
-import queue
-import urllib.request
-import uuid
-from pathlib import Path
-from datetime import datetime
-
-try:
-    import serial
-    import pynmea2
-    _HAS_GPS_LIBS = True
-except ImportError:
-    _HAS_GPS_LIBS = False
-
-
-# ============================================================
-# TELEMETRY READER — unchanged: background thread, own timer,
-# video path only ever reads a cached dict.
-# ============================================================
-
-class TelemetryReader:
-    def __init__(self, interval=1.0, gps_port=None, gps_baud=9600):
-        self.interval = interval
-        self.lock = threading.Lock()
-        self.latest = {
-            'timestamp': time.time(),
-            'gps_lat': 'N/A', 'gps_lng': 'N/A', 'gps_alt': 'N/A',
-            'speed_kmh': 'N/A', 'heading_deg': 'N/A', 'satellites': 'N/A',
-            'gps_fix': False, 'cpu_temp': 'N/A', 'battery': 'N/A',
-        }
-        self.running = False
-        self.thread = None
-        self._gps_serial = None
-        self._override_file = Path("/tmp/telemetry_override.json")
-        self._init_gps(gps_port, gps_baud)
-
-    def _init_gps(self, port, baud):
-        if not _HAS_GPS_LIBS or not port:
-            return
-        try:
-            self._gps_serial = serial.Serial(port, baud, timeout=0.3)
-        except Exception as e:
-            print(f"[Telemetry] Could not open GPS port {port}: {e} -- GPS will read N/A")
-
-    def _read_gps(self):
-        out = {}
-        if self._gps_serial is None:
-            return out
-        try:
-            for _ in range(5):
-                line = self._gps_serial.readline().decode("ascii", errors="ignore").strip()
-                if not line:
-                    break
-                msg = pynmea2.parse(line)
-                if isinstance(msg, pynmea2.types.talker.GGA):
-                    if msg.latitude and msg.longitude:
-                        out['gps_lat'] = msg.latitude
-                        out['gps_lng'] = msg.longitude
-                        out['gps_fix'] = int(msg.gps_qual) > 0
-                    if msg.altitude is not None:
-                        out['gps_alt'] = float(msg.altitude)
-                    if msg.num_sats:
-                        out['satellites'] = int(msg.num_sats)
-                elif isinstance(msg, pynmea2.types.talker.RMC):
-                    if msg.spd_over_grnd is not None:
-                        out['speed_kmh'] = float(msg.spd_over_grnd) * 1.852
-                    if msg.true_course is not None:
-                        out['heading_deg'] = float(msg.true_course)
-        except Exception:
-            pass
-        return out
-
-    def _read_cpu_temp(self):
-        try:
-            with open("/sys/class/thermal/thermal_zone0/temp") as f:
-                return round(int(f.read().strip()) / 1000.0, 1)
-        except Exception:
-            return 'N/A'
-
-    def _read_override(self):
-        if not self._override_file.exists():
-            return {}
-        try:
-            with open(self._override_file) as f:
-                data = json.load(f)
-            mapped = {}
-            if 'lat' in data: mapped['gps_lat'] = data['lat']
-            if 'lon' in data: mapped['gps_lng'] = data['lon']
-            if 'alt_m' in data: mapped['gps_alt'] = data['alt_m']
-            if 'battery_pct' in data: mapped['battery'] = data['battery_pct']
-            return mapped
-        except Exception:
-            return {}
-
-    def _update_once(self):
-        reading = {'timestamp': time.time()}
-        reading.update(self._read_gps())
-        reading['cpu_temp'] = self._read_cpu_temp()
-        reading.update(self._read_override())
-        with self.lock:
-            self.latest.update(reading)
-
-    def _loop(self):
-        while self.running:
-            self._update_once()
-            time.sleep(self.interval)
-
-    def start(self):
-        self.running = True
-        self.thread = threading.Thread(target=self._loop, daemon=True)
-        self.thread.start()
-
-    def stop(self):
-        self.running = False
-        if self.thread:
-            self.thread.join(timeout=2)
-
-    def get_all(self):
-        with self.lock:
-            return dict(self.latest)
-
-
-# ============================================================
-# UPLINK — for telemetry/detection snapshots ONLY. This still
-# goes over normal IP (e.g. a phone hotspot or second radio),
-# NOT over the monitor-mode video link. The video link is
-# one-way broadcast injection, same as WFB-ng's video channel.
-# ============================================================
-
-class Uplink:
-    def __init__(self, base_url, maxsize=50):
-        self.base_url = base_url.rstrip('/') if base_url else None
-        self.q = queue.Queue(maxsize=maxsize)
-        self.running = False
-        self.thread = None
-        self.dropped = 0
-
-    def start(self):
-        if not self.base_url:
-            return
-        self.running = True
-        self.thread = threading.Thread(target=self._loop, daemon=True)
-        self.thread.start()
-
-    def stop(self):
-        self.running = False
-        if self.thread:
-            self.thread.join(timeout=2)
-
-    def post_detection(self, jpeg_bytes, confidence, label='person'):
-        if not self.base_url:
-            return
-        try:
-            self.q.put_nowait(('detection', jpeg_bytes, confidence, label))
-        except queue.Full:
-            self.dropped += 1
-
-    def _loop(self):
-        while self.running:
-            try:
-                item = self.q.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            try:
-                _, jpeg_bytes, confidence, label = item
-                self._post_multipart(jpeg_bytes, confidence, label)
-            except Exception as e:
-                print(f"[Uplink] Send failed (non-fatal): {e}")
-
-    def _post_multipart(self, jpeg_bytes, confidence, label):
-        boundary = uuid.uuid4().hex
-        body = io.BytesIO()
-        body.write(f'--{boundary}\r\nContent-Disposition: form-data; name="confidence"\r\n\r\n{confidence or ""}\r\n'.encode())
-        body.write(f'--{boundary}\r\nContent-Disposition: form-data; name="label"\r\n\r\n{label}\r\n'.encode())
-        body.write(f'--{boundary}\r\nContent-Disposition: form-data; name="image"; filename="det.jpg"\r\nContent-Type: image/jpeg\r\n\r\n'.encode())
-        body.write(jpeg_bytes)
-        body.write(f'\r\n--{boundary}--\r\n'.encode())
-        req = urllib.request.Request(
-            f"{self.base_url}/detection", data=body.getvalue(),
-            headers={'Content-Type': f'multipart/form-data; boundary={boundary}'}, method='POST',
-        )
-        urllib.request.urlopen(req, timeout=3.0)
-
-
-# ============================================================
-# HUMAN DETECTOR — unchanged: throttled, resized, cached
-# ============================================================
-
-class HumanDetector:
-    def __init__(self, detect_width=320):
-        self.use_yolo = False
-        self.model = None
-        self.hog = None
-        self.detection_count = 0
-        self.detect_width = detect_width
-        try:
-            from ultralytics import YOLO
-            self.model = YOLO('yolov8n.pt')
-            self.use_yolo = True
-        except Exception:
-            self.hog = cv2.HOGDescriptor()
-            self.hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
-
-    def detect(self, frame):
-        h, w = frame.shape[:2]
-        scale = self.detect_width / w if w > self.detect_width else 1.0
-        small = cv2.resize(frame, (int(w * scale), int(h * scale))) if scale != 1.0 else frame
-        detections = []
-        if self.use_yolo and self.model:
-            for r in self.model(small, verbose=False):
-                if r.boxes is not None:
-                    for box in r.boxes:
-                        if box.cls == 0:
-                            x1, y1, x2, y2 = map(int, box.xyxy[0])
-                            conf = float(box.conf[0])
-                            detections.append({'bbox': [int(x1/scale), int(y1/scale), int(x2/scale), int(y2/scale)],
-                                                'confidence': conf, 'class': 'person'})
-        elif self.hog:
-            boxes, _ = self.hog.detectMultiScale(small, winStride=(8, 8))
-            for (x, y, bw, bh) in boxes:
-                detections.append({'bbox': [int(x/scale), int(y/scale), int((x+bw)/scale), int((y+bh)/scale)],
-                                    'confidence': 0.5, 'class': 'person'})
-        self.detection_count += len(detections)
-        return detections
-
-
-# ============================================================
-# RAW-LINK STREAMER — the part that's different from the
-# RTSP version: ffmpeg encodes to a bare H.264 stream on
-# stdout, which is piped into `tx` (raw monitor-mode injector)
-# instead of being handed to librtsp/RTSP muxing.
-# ============================================================
-
-class RawLinkStreamer:
-    def __init__(self, tx_path="./tx", width=640, height=344, fps=30, bitrate=2000,
-                 detect=False, save_detections=True, telemetry=True,
-                 telemetry_interval=1.0, detect_every_n_frames=3, detect_width=320,
-                 detection_cooldown=5.0, telemetry_url=None,
-                 gps_port=None, gps_baud=9600):
-        self.tx_path = tx_path
-        self.width = width
-        self.height = height
-        self.fps = fps
-        self.bitrate = bitrate
-        self.detect = detect
-        self.save_detections = save_detections
-        self.telemetry_enabled = telemetry
-
-        self.ffmpeg_proc = None
-        self.tx_proc = None
-
-        self.telemetry = TelemetryReader(interval=telemetry_interval, gps_port=gps_port, gps_baud=gps_baud) if telemetry else None
-        self.detector = HumanDetector(detect_width=detect_width) if detect else None
-        self.uplink = Uplink(telemetry_url) if telemetry_url else None
-
-        self.detect_every_n_frames = max(1, detect_every_n_frames)
-        self.detection_cooldown = detection_cooldown
-        self.last_detection_save_time = 0.0
-        self.last_detections = []
-
-        self.frame_count = 0
-        self.last_stats_time = time.time()
-        self.start_time = time.time()
-
-        if detect and save_detections:
-            self.detection_dir = Path(f"detections_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-            self.detection_dir.mkdir(exist_ok=True)
-            self.detection_log = self.detection_dir / "detections.jsonl"
-
-    def start(self):
-        # ffmpeg: raw BGR frames in on stdin -> bare H.264 elementary
-        # stream out on stdout (no container, no RTSP -- tx.cpp expects
-        # a raw byte stream it can chunk and inject as-is).
-        ffmpeg_cmd = [
-            'ffmpeg', '-loglevel', 'error', '-re',
-            '-f', 'rawvideo', '-vcodec', 'rawvideo', '-pix_fmt', 'bgr24',
-            '-s', f'{self.width}x{self.height}', '-r', str(self.fps), '-i', '-',
-            '-c:v', 'libx264', '-bf', '0', '-preset', 'ultrafast', '-tune', 'zerolatency',
-            '-b:v', f'{self.bitrate}k',
-            '-f', 'h264', '-'   # bare H.264 stream, not muxed into any container
-        ]
-        self.ffmpeg_proc = subprocess.Popen(
-            ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-        )
-
-        # tx reads whatever bytes arrive on stdin and injects them as
-        # raw 802.11 data frames -- feed it ffmpeg's H.264 stdout directly.
-        self.tx_proc = subprocess.Popen(
-            [self.tx_path], stdin=self.ffmpeg_proc.stdout, stderr=sys.stderr
-        )
-        # allow ffmpeg to receive SIGPIPE if tx dies, instead of hanging
-        self.ffmpeg_proc.stdout.close()
-
-        print(f"[RawLink] ffmpeg -> {self.tx_path} (monitor-mode injection)")
-        print(f"[RawLink] {self.width}x{self.height} @ {self.fps}fps, {self.bitrate}kbps")
-        print(f"[RawLink] Detection: {'every ' + str(self.detect_every_n_frames) + ' frames' if self.detect else 'disabled'}")
-        print(f"[RawLink] Telemetry: {'background, ' + str(self.telemetry.interval) + 's interval' if self.telemetry_enabled else 'disabled'}")
-
-        if self.telemetry:
-            self.telemetry.start()
-        if self.uplink:
-            self.uplink.start()
-
-    def _maybe_run_detection(self, frame):
-        if self.frame_count % self.detect_every_n_frames == 0:
-            self.last_detections = self.detector.detect(frame)
-        return self.last_detections
-
-    def _maybe_save_detection(self, frame, detections):
-        if not detections or not self.save_detections:
-            return
-        now = time.time()
-        if now - self.last_detection_save_time < self.detection_cooldown:
-            return
-        self.last_detection_save_time = now
-
-        img = frame.copy()
-        for d in detections:
-            x1, y1, x2, y2 = d['bbox']
-            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 3)
-        cv2.imwrite(str(self.detection_dir / f"detection_{now:.0f}.jpg"), img, [cv2.IMWRITE_JPEG_QUALITY, 95])
-
-        t = self.telemetry.get_all() if self.telemetry_enabled else {}
-        with open(self.detection_log, 'a') as f:
-            f.write(json.dumps({
-                'timestamp': now, 'gps_lat': t.get('gps_lat', 'N/A'), 'gps_lng': t.get('gps_lng', 'N/A'),
-                'gps_alt': t.get('gps_alt', 'N/A'), 'cpu_temp': t.get('cpu_temp', 'N/A'),
-                'battery': t.get('battery', 'N/A'), 'detections': detections, 'frame_count': self.frame_count,
-            }) + '\n')
-
-        if self.uplink:
-            ok, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 95])
-            if ok:
-                best_conf = max((d['confidence'] for d in detections), default=None)
-                self.uplink.post_detection(buf.tobytes(), best_conf, detections[0]['class'])
-
-    def process_frame(self, frame):
-        self.frame_count += 1
-        display = frame.copy()
-        font = cv2.FONT_HERSHEY_SIMPLEX
-
-        if self.telemetry_enabled:
-            t = self.telemetry.get_all()
-            fmt = lambda v, s='': f"{v:.6f}{s}" if isinstance(v, float) else f"{v}{s}"
-            cv2.putText(display, f"GPS: {fmt(t['gps_lat'])}, {fmt(t['gps_lng'])}", (10, 30), font, 0.5, (0, 255, 255), 1)
-            cv2.putText(display, f"Alt: {fmt(t['gps_alt'],'m')} | Bat: {fmt(t['battery'],'%')} | CPU: {fmt(t['cpu_temp'],'C')}", (10, 55), font, 0.5, (0, 255, 255), 1)
-
-        detections = []
-        if self.detect and self.detector:
-            detections = self._maybe_run_detection(frame)
-            for d in detections:
-                x1, y1, x2, y2 = d['bbox']
-                cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(display, f"PERSON {d['confidence']:.2f}", (x1, y1 - 10), font, 0.4, (0, 255, 0), 1)
-            self._maybe_save_detection(frame, detections)
-
-        if time.time() - self.last_stats_time > 5:
-            elapsed = time.time() - self.start_time
-            fps = self.frame_count / elapsed if elapsed > 0 else 0
-            msg = f"[STATS] Frames: {self.frame_count}, FPS: {fps:.1f}"
-            if self.uplink and self.uplink.dropped:
-                msg += f", Uplink dropped: {self.uplink.dropped}"
-            print(msg)
-            self.last_stats_time = time.time()
-
-        return display
-
-    def send_frame(self, frame):
-        if frame is None or self.ffmpeg_proc is None:
-            return False
-        try:
-            if frame.shape[1] != self.width or frame.shape[0] != self.height:
-                frame = cv2.resize(frame, (self.width, self.height))
-            self.ffmpeg_proc.stdin.write(frame.tobytes())
-            return True
-        except BrokenPipeError:
-            print("[RawLink] Broken pipe -- ffmpeg or tx may have stopped")
-            return False
-
-    def stop(self):
-        if self.telemetry:
-            self.telemetry.stop()
-        if self.uplink:
-            self.uplink.stop()
-        for proc in (self.ffmpeg_proc, self.tx_proc):
-            if proc:
-                try:
-                    if proc.stdin:
-                        proc.stdin.close()
-                except Exception:
-                    pass
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=5)
-                except Exception:
-                    proc.kill()
-
-
-def main():
-    parser = argparse.ArgumentParser(description='Air Unit -- SAR streamer over raw monitor-mode Wi-Fi')
-    parser.add_argument('--input', type=str, default='test2.mp4')
-    parser.add_argument('--loop', action='store_true', default=True)
-    parser.add_argument('--tx_path', type=str, default='./tx', help='Path to the compiled tx raw-injector binary')
-    parser.add_argument('--bitrate', type=int, default=2000)
-    parser.add_argument('--stream_width', type=int, default=640)
-    parser.add_argument('--fps', type=int, default=None)
-    parser.add_argument('--detect', action='store_true')
-    parser.add_argument('--no-save', action='store_true')
-    parser.add_argument('--no-telemetry', action='store_true')
-    parser.add_argument('--no-display', action='store_true')
-    parser.add_argument('--telemetry_interval', type=float, default=1.0)
-    parser.add_argument('--detect_every_n_frames', type=int, default=3)
-    parser.add_argument('--detect_width', type=int, default=320)
-    parser.add_argument('--detection_cooldown', type=float, default=5.0)
-    parser.add_argument('--telemetry_url', type=str, default=None)
-    parser.add_argument('--gps_port', type=str, default=None)
-    parser.add_argument('--gps_baud', type=int, default=9600)
-    args = parser.parse_args()
-
-    if not Path(args.input).exists():
-        print(f"ERROR: Input not found: {args.input}")
-        sys.exit(1)
-    if not Path(args.tx_path).exists():
-        print(f"ERROR: tx binary not found at {args.tx_path} -- build it first (see guide sec. 9)")
-        sys.exit(1)
-
-    cap = cv2.VideoCapture(args.input)
-    if not cap.isOpened():
-        print(f"ERROR: Cannot open video: {args.input}")
-        return
-
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = args.fps or int(cap.get(cv2.CAP_PROP_FPS)) or 30
-
-    stream_width = args.stream_width
-    stream_height = int(height * (stream_width / width))
-    stream_width -= stream_width % 2
-    stream_height -= stream_height % 2
-
-    streamer = RawLinkStreamer(
-        tx_path=args.tx_path, width=stream_width, height=stream_height, fps=fps,
-        bitrate=args.bitrate, detect=args.detect, save_detections=not args.no_save,
-        telemetry=not args.no_telemetry, telemetry_interval=args.telemetry_interval,
-        detect_every_n_frames=args.detect_every_n_frames, detect_width=args.detect_width,
-        detection_cooldown=args.detection_cooldown, telemetry_url=args.telemetry_url,
-        gps_port=args.gps_port, gps_baud=args.gps_baud,
-    )
-    streamer.start()
-
-    def handler(sig, frame):
-        streamer.stop()
-        cap.release()
-        cv2.destroyAllWindows()
-        sys.exit(0)
-    signal.signal(signal.SIGINT, handler)
-
-    try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                if args.loop:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    streamer.frame_count = 0
-                    streamer.start_time = time.time()
-                    continue
-                break
-            display = streamer.process_frame(frame)
-            streamer.send_frame(display)
-            if not args.no_display:
-                cv2.imshow('Air Unit Preview', display)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
-    finally:
-        streamer.stop()
-        cap.release()
-        cv2.destroyAllWindows()
-
-
-if __name__ == "__main__":
-    main()
-```
-
----
-
-## 12. Ground Unit — Full Script (`ground_unit.py`)
-
-This is the complete ground unit script that matches the air unit's structure:
-
-```python
-#!/usr/bin/env python3
-"""
-Ground Unit — receives the raw monitor-mode video link from air_unit.py
-=========================================================================
-Pipeline:
-    [rx: raw 802.11 capture] -> [ffmpeg: H.264 -> rawvideo] -> [this script: cv2 display]
-
-This is the counterpart to air_unit.py. It chains two subprocesses exactly
-like the air side did, just in reverse:
-    rx.stdout   -> ffmpeg.stdin   (bare H.264 elementary stream in)
-    ffmpeg.stdout -> this script  (raw BGR frames out, read with cv2/numpy)
-
-Usage:
-    python3 ground_unit.py --rx_path ./rx --width 640 --height 344
-    python3 ground_unit.py --rx_path ./rx --width 640 --height 344 --record out.mp4
-    python3 ground_unit.py --rx_path ./rx --width 640 --height 344 --no-display
-"""
-
-import subprocess
-import numpy as np
-import cv2
-import time
-import sys
-import signal
-import argparse
-from pathlib import Path
-
-
-class GroundReceiver:
-    def __init__(self, rx_path="./rx", width=640, height=344, fps=30, record=None):
-        self.rx_path = rx_path
-        self.width = width
-        self.height = height
-        self.fps = fps
-        self.frame_bytes = width * height * 3  # bgr24
-        self.record = record
-
-        self.rx_proc = None
-        self.ffmpeg_proc = None
-        self.writer = None
-
-        self.frame_count = 0
-        self.start_time = time.time()
-        self.last_stats_time = time.time()
-        self.last_frame_time = time.time()
-
-    def start(self):
-        # rx: sniffs the monitor-mode interface, strips 802.11/radiotap
-        # headers, writes the raw payload bytes (the H.264 stream the air
-        # unit injected) straight to stdout.
-        self.rx_proc = subprocess.Popen(
-            [self.rx_path], stdout=subprocess.PIPE, stderr=sys.stderr
-        )
-
-        # ffmpeg: takes that bare H.264 stream on stdin, decodes it, and
-        # writes raw BGR frames to stdout -- same pixel format the air
-        # unit's ffmpeg read frames in as, so no conversion needed here.
-        ffmpeg_cmd = [
-            'ffmpeg', '-loglevel', 'error',
-            '-fflags', 'nobuffer', '-flags', 'low_delay',
-            '-probesize', '32', '-analyzeduration', '0',
-            '-f', 'h264', '-i', '-',
-            '-pix_fmt', 'bgr24', '-f', 'rawvideo', '-'
-        ]
-        self.ffmpeg_proc = subprocess.Popen(
-            ffmpeg_cmd, stdin=self.rx_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-        )
-        self.rx_proc.stdout.close()  # let rx get SIGPIPE if ffmpeg dies
-
-        if self.record:
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            self.writer = cv2.VideoWriter(self.record, fourcc, self.fps, (self.width, self.height))
-            print(f"[Ground] Recording to {self.record}")
-
-        print(f"[Ground] rx -> ffmpeg -> display  ({self.width}x{self.height})")
-
-    def _read_exact(self, n):
-        """Read exactly n bytes from ffmpeg's stdout, or None on EOF."""
-        buf = bytearray()
-        while len(buf) < n:
-            chunk = self.ffmpeg_proc.stdout.read(n - len(buf))
-            if not chunk:
-                return None
-            buf.extend(chunk)
-        return bytes(buf)
-
-    def read_frame(self):
-        raw = self._read_exact(self.frame_bytes)
-        if raw is None:
-            return None
-        now = time.time()
-        gap = now - self.last_frame_time
-        self.last_frame_time = now
-        self.frame_count += 1
-
-        frame = np.frombuffer(raw, dtype=np.uint8).reshape((self.height, self.width, 3))
-
-        if time.time() - self.last_stats_time > 5:
-            elapsed = time.time() - self.start_time
-            fps = self.frame_count / elapsed if elapsed > 0 else 0
-            print(f"[STATS] Frames: {self.frame_count}, FPS: {fps:.1f}, last frame gap: {gap*1000:.0f}ms")
-            self.last_stats_time = time.time()
-
-        return frame
-
-    def overlay(self, frame):
-        display = frame.copy()
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        elapsed = time.time() - self.start_time
-        fps = self.frame_count / elapsed if elapsed > 0 else 0
-        cv2.putText(display, f"GROUND | Frames: {self.frame_count} | FPS: {fps:.1f}",
-                    (10, 30), font, 0.5, (0, 255, 255), 1)
-        return display
-
-    def write_record(self, frame):
-        if self.writer:
-            self.writer.write(frame)
-
-    def stop(self):
-        if self.writer:
-            self.writer.release()
-        for proc in (self.ffmpeg_proc, self.rx_proc):
-            if proc:
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=5)
-                except Exception:
-                    proc.kill()
-
-
-def main():
-    parser = argparse.ArgumentParser(description='Ground Unit -- decode + display the raw monitor-mode video link')
-    parser.add_argument('--rx_path', type=str, default='./rx', help='Path to the compiled rx raw-receiver binary')
-    parser.add_argument('--width', type=int, default=640, help="Must match --stream_width used on the air unit")
-    parser.add_argument('--height', type=int, default=344, help="Must match the air unit's computed stream height")
-    parser.add_argument('--fps', type=int, default=30)
-    parser.add_argument('--record', type=str, default=None, help='Optional path to save an .mp4 recording of the received feed')
-    parser.add_argument('--no-display', action='store_true')
-    args = parser.parse_args()
-
-    if not Path(args.rx_path).exists():
-        print(f"ERROR: rx binary not found at {args.rx_path} -- build it first: g++ -O2 -o rx rx.cpp")
-        sys.exit(1)
-
-    receiver = GroundReceiver(rx_path=args.rx_path, width=args.width, height=args.height,
-                               fps=args.fps, record=args.record)
-    receiver.start()
-
-    def handler(sig, frame):
-        receiver.stop()
-        cv2.destroyAllWindows()
-        sys.exit(0)
-    signal.signal(signal.SIGINT, handler)
-
-    try:
-        while True:
-            frame = receiver.read_frame()
-            if frame is None:
-                print("[Ground] Stream ended (ffmpeg/rx exited)")
-                break
-
-            display = receiver.overlay(frame)
-            receiver.write_record(frame)
-
-            if not args.no_display:
-                cv2.imshow('Ground Unit', display)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
-    finally:
-        receiver.stop()
-        cv2.destroyAllWindows()
-        print(f"\n[Ground] Total frames received: {receiver.frame_count}")
-
-
-if __name__ == "__main__":
-    main()
-```
-
----
-
-## 13. Quick Reference — All Commands
-
-### Start Monitor Mode
-
-```bash
-sudo airmon-ng check kill
-sudo airmon-ng start wlan0
-sudo iw wlan0mon set channel 149
-```
-
-### Stop Monitor Mode
-
-```bash
-sudo airmon-ng stop wlan0mon
-sudo systemctl restart NetworkManager
-```
-
-### Build C++ Tools
+| Output sink | `ffmpeg -f rtsp rtsp://...` | `ffmpeg -f h264 -` piped into `./tx` |
+| Transport | Normal IP/UDP | Raw 802.11 injection, monitor mode |
+| Telemetry uplink | Same `Uplink` class, same behavior | Unchanged — still goes over a **separate** normal IP link (hotspot/second radio), since the monitor-mode channel is one-way broadcast video only, same as WFB-ng |
+| Detection/telemetry decoupling | Background thread + throttled detection | Identical — kept as-is, it's the fix that matters |
+
+### Build the injector (from section 9)
 
 ```bash
 g++ -O2 -o tx tx.cpp
-g++ -O2 -o rx rx.cpp
 ```
 
-### Run Air Unit
+Put `tx` in the same directory as `air_unit.py` (or pass `--tx_path`).
+
+### Air unit — start monitor mode, then run the streamer
 
 ```bash
-# Basic
-sudo python3 air_unit.py --input test2.mp4 --tx_path ./tx
+sudo airmon-ng check kill
+sudo airmon-ng start wlan0
+sudo iw wlan0mon set channel 149
 
-# With detection
-sudo python3 air_unit.py --input test2.mp4 --tx_path ./tx --detect
+# basic raw video, no detection
+python3 air_unit.py --input test2.mp4 --tx_path ./tx
 
-# Headless (no display)
-sudo python3 air_unit.py --input test2.mp4 --tx_path ./tx --detect --no-display
+# with detection + telemetry, no local preview window (saves CPU)
+python3 air_unit.py --input test2.mp4 --tx_path ./tx --detect --no-display \
+    --detect_every_n_frames 3 --detect_width 320
 
-# With GPS and telemetry uplink
-sudo python3 air_unit.py --input test2.mp4 --tx_path ./tx --detect \
+# with a live GPS module and a telemetry uplink to a dashboard over a SEPARATE
+# normal-IP link (e.g. phone hotspot) -- NOT over the monitor-mode video channel
+python3 air_unit.py --input test2.mp4 --tx_path ./tx --detect \
     --gps_port /dev/serial0 --telemetry_url http://192.168.1.50:8765
-
-# Live camera
-sudo python3 air_unit.py --camera 0 --tx_path ./tx --width 640 --height 480 --fps 30
 ```
 
-### Run Ground Unit
+### Ground unit — receive and decode
 
 ```bash
-# Basic receive + display
+sudo airmon-ng check kill
+sudo airmon-ng start wlan0
+sudo iw wlan0mon set channel 149
+
+# build the receiver (from section 9)
+g++ -O2 -o rx rx.cpp
+
+# run the actual ground-side script (ground_unit.py) -- NOT a bare ffplay pipe.
+# --width/--height MUST match the air unit's --stream_width and its
+# computed stream_height exactly, or the frame math breaks.
 sudo python3 ground_unit.py --rx_path ./rx --width 640 --height 344
 
-# Record incoming stream
+# optionally record the received feed to disk
 sudo python3 ground_unit.py --rx_path ./rx --width 640 --height 344 --record flight.mp4
 
-# Headless (no display)
+# headless (no display window, e.g. a Pi ground station)
 sudo python3 ground_unit.py --rx_path ./rx --width 640 --height 344 --no-display
+```
+
+`ground_unit.py` internally chains `rx -> ffmpeg (H.264 decode, low-latency
+flags) -> cv2 display`, the mirror image of what `air_unit.py` does on the
+way out. If you just want a raw sanity check without Python, the bare
+pipe still works too:
+
+```bash
+sudo ./rx | ffplay -f h264 -fflags nobuffer -flags low_delay -probesize 32 -
+```
+
+### Why this keeps the SAR streamer's speed fix intact
+
+The bottleneck that dropped the original from ~200fps to ~12fps was per-frame
+`vcgencmd` subprocess spawns and duplicated detection passes — none of that
+is touched here. `RawLinkStreamer` is a straight rename/rewire of
+`FFmpegStreamer`: same `TelemetryReader` (own thread, own timer, cached
+reads), same `HumanDetector` (throttled + resized + cached), same `Uplink`
+(fire-and-forget queue). The **only** thing that changed is what's on the
+other end of the pipe — `./tx` (raw injection) instead of `-f rtsp` (normal
+networking).
+
+### Still open (same caveats as section 8/9)
+
+- No FEC yet on the video channel — a corrupted packet will still glitch the
+  H.264 decode on the ground unit until you add Reed-Solomon parity packets.
+- No encryption on the video channel.
+- Telemetry uplink assumes a second, ordinary IP link exists (hotspot, LTE
+  modem, second radio) — if you don't have one, that part just won't send
+  anywhere and the script keeps working fine as a local-only detector/logger.
+## 11. File & Dependency Checklist — What Needs to Be Where
+
+### Air unit (drone / companion computer)
+
+**Files needed in the working directory:**
+
+| File | Where it comes from | Required? |
+|---|---|---|
+| `tx.cpp` → compiled `tx` binary | Section 9 of this guide | Yes |
+| `air_unit.py` | Section 10 | Yes |
+| `test2.mp4` (or any test video) | Your own footage — only needed if you don't have a live camera attached yet | Optional — omit `--input` and use `--camera` flags instead if you wire up real capture (this script currently reads via `cv2.VideoCapture(args.input)`, so a live camera would need the `--input` path swapped for a device index like `cv2.VideoCapture(0)` — ask if you want that variant) |
+| `yolov8n.pt` | Auto-downloaded by `ultralytics` on first run if `--detect` is used and internet is available; falls back to OpenCV's built-in HOG detector if `ultralytics` isn't installed | Optional |
+| `/tmp/telemetry_override.json` | Written by any of your own scripts to feed GPS/battery values in without real hardware | Optional |
+
+**System packages:**
+
+```bash
+sudo apt update
+sudo apt install -y build-essential ffmpeg python3-pip iw aircrack-ng
+```
+
+**Python packages:**
+
+```bash
+pip install --break-system-packages opencv-python numpy
+pip install --break-system-packages pyserial pynmea2   # only if using a real GPS module
+pip install --break-system-packages ultralytics         # only if using --detect with YOLO
+```
+
+**Build:**
+
+```bash
+g++ -O2 -o tx tx.cpp
+```
+
+**Run (minimum working example):**
+
+```bash
+sudo airmon-ng check kill
+sudo airmon-ng start wlan0
+sudo iw wlan0mon set channel 149
+python3 air_unit.py --input test2.mp4 --tx_path ./tx
 ```
 
 ---
 
-## 14. Troubleshooting
+### Ground unit (laptop)
 
-### No video on ground unit
+**Files needed in the working directory:**
 
-1. **Check monitor mode**: `iw dev wlan0 info` should show `type monitor`
-2. **Check channel**: both units must be on the same channel
-3. **Check MAC address**: `dst_mac` in tx.cpp must match `target_mac` in rx.cpp
-4. **Check rx is capturing**: run `sudo ./rx | head -c 100 | xxd` — should see H.264 NAL units (starts with `00 00 00 01`)
-5. **Check air unit is actually writing**: run `sudo python3 air_unit.py --input test2.mp4 --tx_path ./tx --no-display` and watch for `[STATS]` messages
+| File | Where it comes from | Required? |
+|---|---|---|
+| `rx.cpp` → compiled `rx` binary | Section 9 | Yes |
+| `ground_unit.py` | Section 10/this session | Yes |
 
-### Laggy/stuttering video
+That's it — the ground side has no video file, no YOLO model, no GPS
+libraries. It only decodes and displays whatever the air unit is injecting.
 
-- Reduce `--stream_width` to 480 or 320 on air unit
-- Reduce `--bitrate` to 1000 or lower
-- Use C++ tx/rx instead of Python/Scapy
-- Check CPU usage: `top` or `htop`
+**System packages:**
 
-### No detection boxes
+```bash
+sudo apt update
+sudo apt install -y build-essential ffmpeg python3-pip iw aircrack-ng
+```
 
-- Install `ultralytics` for YOLO: `pip install ultralytics`
-- Or use HOG fallback (slower but no extra deps)
-- Check `--detect_width` — smaller values are faster but less accurate
+**Python packages:**
 
-### GPS not working
+```bash
+pip install --break-system-packages opencv-python numpy
+```
 
-- Verify serial port: `ls -la /dev/ttyUSB*` or `/dev/serial0`
-- Check permissions: `sudo chmod 666 /dev/serial0`
-- Test GPS manually: `cat /dev/serial0` (should see NMEA sentences)
-- Install pyserial and pynmea2: `pip install pyserial pynmea2`
+**Build:**
+
+```bash
+g++ -O2 -o rx rx.cpp
+```
+
+**Run (minimum working example):**
+
+```bash
+sudo airmon-ng check kill
+sudo airmon-ng start wlan0
+sudo iw wlan0mon set channel 149
+python3 ground_unit.py --rx_path ./rx --width 640 --height 344
+```
+
+> `--width`/`--height` must match what the air unit computed. With the
+> default `--stream_width 640` and a 1280x720 source video, `air_unit.py`
+> computes `stream_height = 640 * (720/1280) = 360`, then rounds down to
+> the nearest even number → **344 only applies if your source is a
+> 640x344-ish aspect ratio; check the console output of `air_unit.py`
+> on startup — it doesn't currently print the final resolution, so add
+> `print(stream_width, stream_height)` right after they're computed in
+> `main()` if you want to confirm the exact numbers before starting the
+> ground unit.**
+
+---
+
+### Optional third machine: the telemetry dashboard
+
+Only needed if you pass `--telemetry_url` to `air_unit.py`. This is a
+**separate normal-IP server** (not part of the monitor-mode link) that
+receives POSTed detection JPEGs + GPS/battery data. Nothing in this guide
+builds that server for you yet — `air_unit.py` just assumes something is
+listening at `<url>/detection` and accepts a multipart POST. If you want,
+I can write a minimal `telemetry_broadcaster.py` (Flask/FastAPI) to match
+what `Uplink._post_multipart()` expects.
+
+---
+
+### Quick summary table
+
+| | Air unit | Ground unit |
+|---|---|---|
+| Script | `air_unit.py` | `ground_unit.py` |
+| Compiled binary | `tx` (from `tx.cpp`) | `rx` (from `rx.cpp`) |
+| Test video | `test2.mp4` (or your own) | Not needed |
+| YOLO model | Optional, auto-downloaded | Not needed |
+| GPS libs | Optional (`pyserial`, `pynmea2`) | Not needed |
+| Monitor mode required | Yes | Yes |
+| Same Wi-Fi channel as other side | Yes | Yes |
