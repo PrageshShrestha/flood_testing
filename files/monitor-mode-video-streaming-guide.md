@@ -651,10 +651,17 @@ g++ -O2 -o rx rx.cpp
 **Run (minimum working example):**
 
 ```bash
+# 1. Kill interfering processes
 sudo airmon-ng check kill
-sudo airmon-ng start wlan0
-sudo iw wlan0mon set channel 149
-python3 ground_unit.py --rx_path ./rx --width 640 --height 344
+
+# 2. Start monitor mode on your interface
+sudo airmon-ng start wlxd0374558ffd4
+
+# 3. Set channel
+sudo iw wlxd0374558ffd4mon set channel 149
+
+# 4. Run the ground-side script
+sudo python3 ground_unit.py --rx_path ./rx --width 640 --height 344 --iface wlxd0374558ffd4mon
 ```
 
 > `--width`/`--height` must match what the air unit computed. With the
