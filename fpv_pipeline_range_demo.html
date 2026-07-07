@@ -1,0 +1,91 @@
+<div>
+<h2 class="sr-only">Animated diagram of an analog FPV pipeline from a Raspberry Pi 5 air unit with Hailo inference, through a 5.8GHz VTX/VRX link, to a ground laptop, with a range comparison chart</h2>
+
+<style>
+@keyframes flowdash { to { stroke-dashoffset: -24; } }
+@keyframes pulse { 0%,100% { opacity:.35 } 50% { opacity:1 } }
+@keyframes rf { 0% { r:6; opacity:.9 } 100% { r:50; opacity:0 } }
+.flow { stroke-dasharray:6 6; animation: flowdash 1s linear infinite; }
+.pulse { animation: pulse 1.6s ease-in-out infinite; }
+.rf-wave { animation: rf 2s ease-out infinite; }
+</style>
+
+<svg width="100%" viewBox="0 0 680 460" role="img">
+<title>Air-to-ground analog FPV pipeline</title>
+<desc>Raspberry Pi 5 with camera and Hailo accelerator overlays inference data on video, converts to composite, broadcasts via VTX over 5.8GHz to a ground VRX, then into a laptop via USB capture</desc>
+<defs>
+<marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker>
+</defs>
+
+<!-- Air unit container -->
+<g class="c-teal">
+<rect x="30" y="30" width="290" height="200" rx="16" stroke-width="0.5"/>
+<text class="th" x="46" y="54">Air unit</text>
+</g>
+<g class="c-gray node" onclick="sendPrompt('Tell me more about the Pi camera to Hailo inference step')">
+<rect x="50" y="70" width="110" height="50" rx="8" stroke-width="0.5"/>
+<text class="th" x="105" y="88" text-anchor="middle" dominant-baseline="central">Pi 5 + Hailo</text>
+<text class="ts" x="105" y="104" text-anchor="middle" dominant-baseline="central">camera + inference</text>
+</g>
+<line x1="160" y1="95" x2="188" y2="95" class="arr flow" marker-end="url(#arrow)"/>
+<g class="c-gray node" onclick="sendPrompt('How does the HDMI to composite conversion work?')">
+<rect x="190" y="70" width="110" height="50" rx="8" stroke-width="0.5"/>
+<text class="th" x="245" y="88" text-anchor="middle" dominant-baseline="central">HDMI→CVBS</text>
+<text class="ts" x="245" y="104" text-anchor="middle" dominant-baseline="central">composite out</text>
+</g>
+<line x1="245" y1="120" x2="245" y2="150" class="arr flow" marker-end="url(#arrow)"/>
+<g class="c-coral node" onclick="sendPrompt('How does the analog VTX broadcast the signal?')">
+<rect x="105" y="152" width="180" height="50" rx="8" stroke-width="0.5"/>
+<text class="th" x="195" y="170" text-anchor="middle" dominant-baseline="central">Analog VTX</text>
+<text class="ts" x="195" y="186" text-anchor="middle" dominant-baseline="central">5.8GHz + CP antenna</text>
+</g>
+
+<!-- RF link -->
+<circle class="rf-wave" cx="330" cy="177" r="6" fill="none" stroke="#D85A30" stroke-width="1.5"/>
+<circle class="rf-wave" cx="330" cy="177" r="6" fill="none" stroke="#D85A30" stroke-width="1.5" style="animation-delay:.6s"/>
+<circle class="rf-wave" cx="330" cy="177" r="6" fill="none" stroke="#D85A30" stroke-width="1.5" style="animation-delay:1.2s"/>
+<text class="ts pulse" x="380" y="145" text-anchor="middle">5.8GHz RF</text>
+
+<!-- Ground unit container -->
+<g class="c-blue">
+<rect x="360" y="30" width="290" height="200" rx="16" stroke-width="0.5"/>
+<text class="th" x="376" y="54">Ground unit</text>
+</g>
+<g class="c-gray node" onclick="sendPrompt('How does the analog VRX receive the signal?')">
+<rect x="395" y="152" width="150" height="50" rx="8" stroke-width="0.5"/>
+<text class="th" x="470" y="170" text-anchor="middle" dominant-baseline="central">Analog VRX</text>
+<text class="ts" x="470" y="186" text-anchor="middle" dominant-baseline="central">CP antenna</text>
+</g>
+<line x1="470" y1="152" x2="470" y2="120" class="arr flow" marker-end="url(#arrow)"/>
+<g class="c-gray node" onclick="sendPrompt('How does the USB capture dongle work?')">
+<rect x="405" y="70" width="130" height="50" rx="8" stroke-width="0.5"/>
+<text class="th" x="470" y="88" text-anchor="middle" dominant-baseline="central">USB capture</text>
+<text class="ts" x="470" y="104" text-anchor="middle" dominant-baseline="central">UVC dongle</text>
+</g>
+<line x1="535" y1="95" x2="563" y2="95" class="arr flow" marker-end="url(#arrow)"/>
+<g class="c-purple node" onclick="sendPrompt('What software should I use to view the feed on my laptop?')">
+<rect x="565" y="70" width="70" height="50" rx="8" stroke-width="0.5"/>
+<text class="th" x="600" y="88" text-anchor="middle" dominant-baseline="central">Laptop</text>
+<text class="ts" x="600" y="104" text-anchor="middle" dominant-baseline="central">OBS/VLC</text>
+</g>
+
+<!-- caption -->
+<text class="ts" x="340" y="250" text-anchor="middle">Video-only RF hop — extra data must be burned into the frame as OSD text</text>
+
+<!-- Range comparison -->
+<text class="th" x="40" y="295">Range by setup</text>
+<g>
+<rect x="40" y="310" width="600" height="24" rx="4" fill="var(--surface-1)"/>
+<rect x="40" y="310" width="60" height="24" rx="4" class="c-gray"/>
+<text class="ts" x="45" y="345">25mW, stock &#8776; 0.2km</text>
+
+<rect x="40" y="355" width="600" height="24" rx="4" fill="var(--surface-1)"/>
+<rect x="40" y="355" width="180" height="24" rx="4" class="c-teal"/>
+<text class="ts" x="45" y="390">600-800mW, CP antennas &#8776; 4km</text>
+
+<rect x="40" y="400" width="600" height="24" rx="4" fill="var(--surface-1)"/>
+<rect x="40" y="400" width="560" height="24" rx="4" class="c-coral"/>
+<text class="ts" x="45" y="435">1-2W, directional tracking antenna &#8776; 10km+</text>
+</g>
+</svg>
+</div>
