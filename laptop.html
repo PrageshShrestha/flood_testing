@@ -1,0 +1,1033 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>SAR GROUND STATION</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    background: #000;
+    color: #e8e8e8;
+    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+    font-size: 13px;
+  }
+  .mono { font-family: "SF Mono", "Roboto Mono", Menlo, Consolas, monospace; }
+  #app { display: flex; flex-direction: column; min-height: 100vh; }
+
+  #topbar {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    padding: 10px 18px;
+    background: #000;
+    border-bottom: 1px solid #262626;
+  }
+  #topbar h1 {
+    font-size: 12px;
+    font-weight: 700;
+    margin: 0;
+    letter-spacing: 0.22em;
+    color: #fff;
+  }
+  #topbar h1 span { color: #666; font-weight: 400; }
+  .divider { width: 1px; height: 18px; background: #2a2a2a; }
+  #topbar input {
+    background: #0a0a0a;
+    border: 1px solid #2a2a2a;
+    color: #ccc;
+    padding: 6px 9px;
+    font-size: 11px;
+    width: 220px;
+    font-family: "SF Mono", Menlo, monospace;
+    letter-spacing: 0.02em;
+  }
+  #topbar input:focus { outline: none; border-color: #555; }
+  #topbar button {
+    background: transparent;
+    border: 1px solid #3a3a3a;
+    color: #ddd;
+    padding: 6px 16px;
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    cursor: pointer;
+    font-weight: 600;
+  }
+  #topbar button:hover { border-color: #888; }
+  #topbar button:disabled { opacity: 0.3; cursor: default; }
+
+  .status {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    font-weight: 700;
+    color: #888;
+  }
+  .status .dot { width: 6px; height: 6px; border-radius: 50%; background: #444; flex-shrink: 0; }
+  .status.live .dot { background: #17d165; box-shadow: 0 0 6px #17d16588; }
+  .status.live { color: #17d165; }
+  .status.lost .dot { background: #ff3b30; }
+  .status.lost { color: #ff3b30; }
+  .status.stale .dot { background: #d1a617; }
+  .status.stale { color: #d1a617; }
+
+  .spacer { flex: 1; }
+
+  #viewToggle { display: flex; border: 1px solid #2a2a2a; }
+  #viewToggle button {
+    border: none;
+    background: transparent;
+    color: #888;
+    padding: 6px 16px;
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    cursor: pointer;
+    font-weight: 600;
+    border-right: 1px solid #2a2a2a;
+  }
+  #viewToggle button:last-child { border-right: none; }
+  #viewToggle button.active { background: #fff; color: #000; }
+  #viewToggle button:hover:not(.active) { color: #fff; }
+
+  #main { display: flex; flex: 1; min-height: 0; }
+  #centerPane {
+    flex: 1;
+    position: relative;
+    background: #000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 62vh;
+    border-right: 1px solid #1a1a1a;
+  }
+  #centerPane.hidden-pane { display: none; }
+  video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+
+  .reticle { position: absolute; inset: 14px; pointer-events: none; }
+  .reticle span { position: absolute; width: 18px; height: 18px; border: 1px solid #ffffff55; }
+  .reticle .tl { top: 0; left: 0; border-right: none; border-bottom: none; }
+  .reticle .tr { top: 0; right: 0; border-left: none; border-bottom: none; }
+  .reticle .bl { bottom: 0; left: 0; border-right: none; border-top: none; }
+  .reticle .br { bottom: 0; right: 0; border-left: none; border-top: none; }
+
+  .overlay-top {
+    position: absolute;
+    top: 20px; left: 20px;
+    font-family: "SF Mono", Menlo, monospace;
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    color: #999;
+    display: none;
+    line-height: 1.9;
+  }
+  .overlay-top .row { display: flex; gap: 10px; }
+  .overlay-top .k { color: #666; width: 62px; display: inline-block; }
+  .overlay-top .v { color: #fff; font-weight: 600; }
+  .overlay-top .v.warn { color: #d1a617; }
+  .overlay-top .v.bad { color: #ff3b30; }
+
+  .hud-bottom {
+    position: absolute;
+    left: 0; right: 0; bottom: 0;
+    display: none;
+    justify-content: space-between;
+    padding: 14px 26px;
+    background: linear-gradient(to top, rgba(0,0,0,0.85), transparent);
+    font-family: "SF Mono", Menlo, monospace;
+  }
+  .hud-metric { text-align: left; }
+  .hud-metric.right { text-align: right; }
+  .hud-metric .num { font-size: 26px; font-weight: 700; color: #fff; letter-spacing: 0.01em; }
+  .hud-metric .num .unit { font-size: 13px; color: #888; margin-left: 4px; font-weight: 400; }
+  .hud-metric .lbl { font-size: 9px; letter-spacing: 0.18em; color: #666; text-transform: uppercase; margin-top: 2px; }
+
+  #mapPane { flex: 1; background: #050505; position: relative; min-height: 62vh; }
+  #mapPane.hidden-pane { display: none; }
+  #mapPane svg { width: 100%; height: 100%; display: block; }
+
+  #sidebar {
+    width: 250px;
+    background: #000;
+    border-left: 1px solid #1a1a1a;
+    padding: 0;
+    overflow-y: auto;
+    font-size: 11px;
+  }
+  #sidebar h2 {
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.16em;
+    color: #666;
+    margin: 0;
+    padding: 14px 16px 8px;
+    border-bottom: 1px solid #1a1a1a;
+    font-weight: 700;
+  }
+  .sec { padding: 10px 16px 14px; border-bottom: 1px solid #141414; }
+  .tele-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 4px 0;
+    font-family: "SF Mono", Menlo, monospace;
+    letter-spacing: 0.02em;
+  }
+  .tele-row .k { color: #666; }
+  .tele-row .v { color: #fff; font-weight: 600; }
+  .tele-row .v.na { color: #3a3a3a; font-weight: 400; }
+  .tele-row .v.warn { color: #d1a617; }
+  .tele-row .v.bad { color: #ff3b30; }
+
+  #recordBtn {
+    width: 100%; margin-top: 8px;
+    background: transparent; border: 1px solid #3a3a3a; color: #ddd;
+    padding: 9px; font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase;
+    cursor: pointer; font-weight: 700;
+  }
+  #recordBtn:hover { border-color: #888; }
+  #recordBtn.recording { border-color: #ff3b30; color: #ff3b30; }
+  .export-btns { display: flex; gap: 6px; margin-top: 6px; }
+  .export-btns button {
+    flex: 1; font-size: 9px; padding: 7px; background: transparent;
+    border: 1px solid #2a2a2a; color: #999; cursor: pointer; letter-spacing: 0.1em; text-transform: uppercase; font-weight: 700;
+  }
+  .export-btns button:disabled { opacity: 0.3; cursor: default; }
+  .export-btns button:hover:not(:disabled) { border-color: #888; color: #fff; }
+
+  #detectionList { max-height: 240px; overflow-y: auto; }
+  .det-item {
+    display: flex; gap: 9px; padding: 7px 0;
+    border-bottom: 1px solid #141414; cursor: pointer; align-items: center;
+  }
+  .det-item:hover .meta .t { color: #fff; }
+  .det-item img { width: 38px; height: 38px; object-fit: cover; border: 1px solid #2a2a2a; filter: grayscale(20%); }
+  .det-item .meta { font-family: "SF Mono", Menlo, monospace; font-size: 9px; color: #666; line-height: 1.5; }
+  .det-item .meta .t { color: #ccc; font-weight: 600; letter-spacing: 0.03em; }
+  #noDetections { color: #3a3a3a; font-size: 10px; padding: 6px 0; font-family: "SF Mono", Menlo, monospace; }
+
+  #lightbox {
+    display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.94);
+    z-index: 100; align-items: center; justify-content: center; flex-direction: column;
+  }
+  #lightbox.open { display: flex; }
+  #lightbox img { max-width: 88vw; max-height: 74vh; border: 1px solid #333; }
+  #lightbox .lb-meta {
+    margin-top: 16px; font-family: "SF Mono", Menlo, monospace; font-size: 11px;
+    color: #999; display: flex; gap: 26px; letter-spacing: 0.04em;
+  }
+  #lightbox .lb-meta b { color: #fff; font-weight: 700; }
+  #lightbox button {
+    position: absolute; top: 24px; right: 30px; background: transparent;
+    border: 1px solid #3a3a3a; color: #ccc; padding: 8px 16px; cursor: pointer;
+    font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; font-weight: 700;
+  }
+
+  #chooseFolderBtn {
+    width: 100%;
+    background: transparent;
+    border: 1px solid #3a3a3a;
+    color: #ddd;
+    padding: 9px;
+    font-size: 10px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    cursor: pointer;
+    font-weight: 700;
+  }
+  #chooseFolderBtn:hover { border-color: #888; }
+  #chooseFolderBtn:disabled { opacity: 0.3; cursor: default; }
+
+  .recording-status {
+    font-size: 9px;
+    letter-spacing: 0.08em;
+    color: #666;
+    text-transform: uppercase;
+    font-weight: 700;
+  }
+  .recording-status.active { color: #ff3b30; }
+  .recording-status.done { color: #17d165; }
+</style>
+</head>
+<body>
+
+<div id="app">
+  <div id="topbar">
+    <h1>SAR GROUND STATION <span>// KATHMANDU VALLEY</span></h1>
+    <div class="divider"></div>
+    <input id="whepUrl" placeholder="WHEP video URL" value="http://10.42.0.1:8889/yolo_stream/whep">
+    <input id="teleUrl" placeholder="Telemetry WS URL" value="ws://10.42.0.1:8765/ws">
+    <button id="connectBtn">Connect</button>
+    <button id="disconnectBtn" disabled>Disconnect</button>
+    <span class="status lost" id="videoBadge"><span class="dot"></span>VIDEO</span>
+    <span class="status lost" id="teleBadge"><span class="dot"></span>TELEMETRY</span>
+    <div class="spacer"></div>
+    <div id="viewToggle">
+      <button id="showVideoBtn" class="active">Video</button>
+      <button id="showMapBtn">Map</button>
+      <button id="showBothBtn">Both</button>
+    </div>
+  </div>
+
+  <div id="main">
+    <div id="centerPane">
+      <video id="video" autoplay playsinline muted></video>
+      <div class="reticle"><span class="tl"></span><span class="tr"></span><span class="bl"></span><span class="br"></span></div>
+
+      <div class="overlay-top" id="videoOverlay">
+        <div class="row"><span class="k">FPS</span><span class="v" id="s-fps">--</span></div>
+        <div class="row"><span class="k">RES</span><span class="v" id="s-res">--</span></div>
+        <div class="row"><span class="k">BITRATE</span><span class="v" id="s-bitrate">--</span></div>
+        <div class="row"><span class="k">JITTER</span><span class="v" id="s-jitter">--</span></div>
+        <div class="row"><span class="k">RTT</span><span class="v" id="s-rtt">--</span></div>
+      </div>
+
+      <div class="hud-bottom" id="hudBottom">
+        <div class="hud-metric">
+          <div class="num" id="hud-alt">--<span class="unit">M ALT</span></div>
+          <div class="lbl">Altitude</div>
+        </div>
+        <div class="hud-metric">
+          <div class="num" id="hud-speed">--<span class="unit">KM/H</span></div>
+          <div class="lbl">Speed</div>
+        </div>
+        <div class="hud-metric">
+          <div class="num" id="hud-heading">--<span class="unit">DEG</span></div>
+          <div class="lbl">Heading</div>
+        </div>
+        <div class="hud-metric right">
+          <div class="num" id="hud-battery">--<span class="unit">%</span></div>
+          <div class="lbl">Battery</div>
+        </div>
+        <div class="hud-metric right">
+          <div class="num" id="hud-cputemp">--<span class="unit">°C</span></div>
+          <div class="lbl">CPU Temp</div>
+        </div>
+      </div>
+    </div>
+
+    <div id="mapPane" class="hidden-pane">
+      <svg id="mapSvg" viewBox="0 0 800 760" preserveAspectRatio="xMidYMid meet"></svg>
+    </div>
+
+    <div id="sidebar">
+      <h2>Position</h2>
+      <div class="sec">
+        <div class="tele-row"><span class="k">LAT</span><span class="v na" id="t-lat">N/A</span></div>
+        <div class="tele-row"><span class="k">LON</span><span class="v na" id="t-lon">N/A</span></div>
+        <div class="tele-row"><span class="k">ALT</span><span class="v na" id="t-alt">N/A</span></div>
+        <div class="tele-row"><span class="k">SPD</span><span class="v na" id="t-speed">N/A</span></div>
+        <div class="tele-row"><span class="k">HDG</span><span class="v na" id="t-heading">N/A</span></div>
+        <div class="tele-row"><span class="k">SATS</span><span class="v na" id="t-sats">N/A</span></div>
+        <div class="tele-row"><span class="k">FIX</span><span class="v na" id="t-fix">N/A</span></div>
+      </div>
+
+      <h2>System</h2>
+      <div class="sec">
+        <div class="tele-row"><span class="k">BATTERY</span><span class="v na" id="t-battery">N/A</span></div>
+        <div class="tele-row"><span class="k">CPU TEMP</span><span class="v na" id="t-cputemp">N/A</span></div>
+        <div class="tele-row"><span class="k">UPDATED</span><span class="v na" id="t-lastupdate">--</span></div>
+      </div>
+
+      <h2>Session Recording</h2>
+      <div class="sec">
+        <button id="chooseFolderBtn">Choose save folder</button>
+        <div class="tele-row" style="margin-top:6px"><span class="k">FOLDER</span><span class="v na" id="t-folder">Not set</span></div>
+        <button id="recordBtn" style="margin-top:8px">Start recording</button>
+        <div class="tele-row" style="margin-top:6px"><span class="k">RUN</span><span class="v na" id="t-run">--</span></div>
+        <div class="tele-row" style="margin-top:2px">
+          <span class="k">VIDEO</span>
+          <span class="v" id="t-video-status" style="font-size:9px;color:#666;">Not recording</span>
+        </div>
+        <div class="export-btns">
+          <button id="exportCsvBtn" disabled>CSV (manual)</button>
+          <button id="exportJsonBtn" disabled>JSON (manual)</button>
+        </div>
+        <div class="tele-row" style="margin-top:8px"><span class="k">SAMPLES</span><span class="v" id="t-samples">0</span></div>
+        <div class="tele-row"><span class="k">PHOTOS SAVED</span><span class="v" id="t-photossaved">0</span></div>
+      </div>
+
+      <h2>Human Detections (<span id="detCount">0</span>)</h2>
+      <div class="sec">
+        <div id="detectionList"><div id="noDetections">None yet this session.</div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="lightbox">
+  <button id="lbClose">Close</button>
+  <img id="lbImg" src="">
+  <div class="lb-meta" id="lbMeta"></div>
+</div>
+
+<script>
+const MAP_BOUNDS = { latMin: 27.615, latMax: 27.800, lonMin: 85.235, lonMax: 85.445 };
+const MAP_W = 800, MAP_H = 760;
+
+function project(lat, lon) {
+  const x = (lon - MAP_BOUNDS.lonMin) / (MAP_BOUNDS.lonMax - MAP_BOUNDS.lonMin) * MAP_W;
+  const y = (MAP_BOUNDS.latMax - lat) / (MAP_BOUNDS.latMax - MAP_BOUNDS.latMin) * MAP_H;
+  return { x, y };
+}
+
+const RIVERS = {
+  "Bagmati": [[27.7833,85.4167],[27.7192,85.3611],[27.7106,85.3487],[27.6939,85.3145],
+              [27.6947,85.3086],[27.6900,85.2950],[27.6667,85.2917],[27.6450,85.2820]],
+  "Bishnumati": [[27.7500,85.2833],[27.7333,85.3000],[27.7167,85.3083],[27.7100,85.3100],[27.6947,85.3086]],
+  "Dhobi Khola": [[27.7375,85.3706],[27.7192,85.3486],[27.6944,85.3375],[27.6939,85.3200]],
+  "Manohara": [[27.7500,85.3833],[27.7000,85.3611],[27.6858,85.3439]],
+  "Hanumante": [[27.6710,85.4298],[27.6850,85.4050],[27.6917,85.3833]],
+  "Nakkhu": [[27.6300,85.3100],[27.6450,85.3150],[27.6550,85.3200]],
+};
+
+const LANDMARKS = [
+  { name: "KATHMANDU", lat: 27.7040, lon: 85.3070 },
+  { name: "PATAN", lat: 27.6727, lon: 85.3247 },
+  { name: "BHAKTAPUR", lat: 27.6710, lon: 85.4298 },
+  { name: "AIRPORT", lat: 27.6966, lon: 85.3591 },
+  { name: "SWAYAMBHUNATH", lat: 27.7149, lon: 85.2903 },
+  { name: "BOUDHANATH", lat: 27.7215, lon: 85.3620 },
+  { name: "PASHUPATINATH", lat: 27.7106, lon: 85.3487 },
+];
+
+function buildMap() {
+  const svg = document.getElementById('mapSvg');
+  let html = '';
+  html += `<rect x="0" y="0" width="${MAP_W}" height="${MAP_H}" fill="#050505"/>`;
+
+  for (let lat = Math.ceil(MAP_BOUNDS.latMin/0.02)*0.02; lat <= MAP_BOUNDS.latMax; lat += 0.02) {
+    const p1 = project(lat, MAP_BOUNDS.lonMin), p2 = project(lat, MAP_BOUNDS.lonMax);
+    html += `<line x1="${p1.x}" y1="${p1.y}" x2="${p2.x}" y2="${p2.y}" stroke="#141414" stroke-width="1"/>`;
+  }
+  for (let lon = Math.ceil(MAP_BOUNDS.lonMin/0.02)*0.02; lon <= MAP_BOUNDS.lonMax; lon += 0.02) {
+    const p1 = project(MAP_BOUNDS.latMin, lon), p2 = project(MAP_BOUNDS.latMax, lon);
+    html += `<line x1="${p1.x}" y1="${p1.y}" x2="${p2.x}" y2="${p2.y}" stroke="#141414" stroke-width="1"/>`;
+  }
+
+  for (const [name, pts] of Object.entries(RIVERS)) {
+    const path = pts.map(([lat, lon], i) => {
+      const p = project(lat, lon);
+      return (i === 0 ? 'M' : 'L') + p.x.toFixed(1) + ',' + p.y.toFixed(1);
+    }).join(' ');
+    const width = name === 'Bagmati' ? 3.5 : 1.8;
+    html += `<path d="${path}" fill="none" stroke="#5a6a75" stroke-width="${width}" stroke-linecap="round" stroke-linejoin="round" opacity="0.9"/>`;
+    const mid = pts[Math.floor(pts.length/2)];
+    const mp = project(mid[0], mid[1]);
+    html += `<text x="${mp.x+6}" y="${mp.y-4}" fill="#4a5a65" font-size="9" font-family="monospace" letter-spacing="1">${name.toUpperCase()}</text>`;
+  }
+
+  for (const lm of LANDMARKS) {
+    const p = project(lm.lat, lm.lon);
+    html += `<circle cx="${p.x}" cy="${p.y}" r="2" fill="#555"/>`;
+    html += `<text x="${p.x+6}" y="${p.y+3}" fill="#4a4a4a" font-size="8" font-family="monospace" letter-spacing="0.5">${lm.name}</text>`;
+  }
+
+  html += `<polyline id="droneTrail" points="" fill="none" stroke="#fff" stroke-width="1.5" opacity="0.55"/>`;
+  html += `<g id="detectionMarkers"></g>`;
+  html += `<g id="droneMarker" style="display:none">
+             <circle r="11" fill="none" stroke="#fff" stroke-width="1" opacity="0.35"/>
+             <circle r="3.5" fill="#fff"/>
+           </g>`;
+  svg.innerHTML = html;
+}
+buildMap();
+
+const centerPane = document.getElementById('centerPane');
+const mapPane = document.getElementById('mapPane');
+const btnVideo = document.getElementById('showVideoBtn');
+const btnMap = document.getElementById('showMapBtn');
+const btnBoth = document.getElementById('showBothBtn');
+
+function setView(mode) {
+  [btnVideo, btnMap, btnBoth].forEach(b => b.classList.remove('active'));
+  if (mode === 'video') { centerPane.classList.remove('hidden-pane'); mapPane.classList.add('hidden-pane'); btnVideo.classList.add('active'); }
+  if (mode === 'map') { centerPane.classList.add('hidden-pane'); mapPane.classList.remove('hidden-pane'); btnMap.classList.add('active'); }
+  if (mode === 'both') { centerPane.classList.remove('hidden-pane'); mapPane.classList.remove('hidden-pane'); btnBoth.classList.add('active'); centerPane.style.flex = '1'; mapPane.style.flex = '1'; }
+}
+btnVideo.onclick = () => setView('video');
+btnMap.onclick = () => setView('map');
+btnBoth.onclick = () => setView('both');
+
+let pc = null, statsTimer = null, prevStats = null;
+const video = document.getElementById('video');
+const videoOverlay = document.getElementById('videoOverlay');
+const hudBottom = document.getElementById('hudBottom');
+const videoBadge = document.getElementById('videoBadge');
+
+// ====== VIDEO RECORDING WITH MediaRecorder ======
+let mediaRecorder = null;
+let videoChunks = [];
+let videoChunkWrites = []; // Track chunks written to disk
+let videoRecordingActive = false;
+let videoWritableStream = null;
+
+function fmtBitrate(bps) {
+  if (bps > 1e6) return (bps/1e6).toFixed(2) + ' Mbps';
+  if (bps > 1e3) return (bps/1e3).toFixed(0) + ' kbps';
+  return bps.toFixed(0) + ' bps';
+}
+function setStatus(el, state, label) {
+  el.className = 'status ' + state;
+  el.innerHTML = `<span class="dot"></span>${label}`;
+}
+
+async function connectVideo(whepUrl) {
+  pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+  pc.addTransceiver('video', { direction: 'recvonly' });
+  pc.addTransceiver('audio', { direction: 'recvonly' });
+  pc.ontrack = (e) => { 
+    if (video.srcObject !== e.streams[0]) {
+      video.srcObject = e.streams[0];
+    }
+  };
+  pc.oniceconnectionstatechange = () => {
+    if (pc.iceConnectionState === 'connected') {
+      setStatus(videoBadge, 'live', 'VIDEO');
+      videoOverlay.style.display = 'block';
+      hudBottom.style.display = 'flex';
+      statsTimer = setInterval(pollVideoStats, 1000);
+    }
+    if (['failed','disconnected','closed'].includes(pc.iceConnectionState)) {
+      setStatus(videoBadge, 'lost', 'VIDEO');
+      if (statsTimer) clearInterval(statsTimer);
+    }
+  };
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  await new Promise(res => {
+    if (pc.iceGatheringState === 'complete') return res();
+    const chk = () => { if (pc.iceGatheringState === 'complete') { pc.removeEventListener('icegatheringstatechange', chk); res(); } };
+    pc.addEventListener('icegatheringstatechange', chk);
+    setTimeout(res, 2000);
+  });
+  const res = await fetch(whepUrl, { method: 'POST', headers: { 'Content-Type': 'application/sdp' }, body: pc.localDescription.sdp });
+  if (!res.ok) throw new Error('WHEP server returned ' + res.status);
+  const answerSdp = await res.text();
+  await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+}
+
+async function pollVideoStats() {
+  if (!pc) return;
+  const stats = await pc.getStats();
+  let inbound = null, pair = null;
+  stats.forEach(r => {
+    if (r.type === 'inbound-rtp' && r.kind === 'video') inbound = r;
+    if (r.type === 'candidate-pair' && r.state === 'succeeded') pair = r;
+  });
+  if (!inbound) return;
+  const now = performance.now();
+  let fps = inbound.framesPerSecond;
+  if (prevStats) {
+    const dtSec = (now - prevStats.t) / 1000;
+    if (fps === undefined && dtSec > 0) fps = (inbound.framesDecoded - prevStats.framesDecoded) / dtSec;
+    const byteDelta = inbound.bytesReceived - prevStats.bytesReceived;
+    document.getElementById('s-bitrate').textContent = fmtBitrate(dtSec > 0 ? (byteDelta*8)/dtSec : 0);
+  }
+  const fpsEl = document.getElementById('s-fps');
+  fpsEl.textContent = fps !== undefined ? fps.toFixed(1) : '--';
+  fpsEl.className = 'v' + (fps < 10 ? ' bad' : fps < 20 ? ' warn' : '');
+  document.getElementById('s-res').textContent = (inbound.frameWidth && inbound.frameHeight) ? `${inbound.frameWidth}x${inbound.frameHeight}` : '--';
+  document.getElementById('s-jitter').textContent = inbound.jitter !== undefined ? (inbound.jitter*1000).toFixed(1) + ' ms' : '--';
+  document.getElementById('s-rtt').textContent = pair && pair.currentRoundTripTime !== undefined ? (pair.currentRoundTripTime*1000).toFixed(0) + ' ms' : '--';
+  prevStats = { t: now, framesDecoded: inbound.framesDecoded, bytesReceived: inbound.bytesReceived };
+  if (recording) logSample();
+}
+
+let ws = null, wsRetryTimer = null, lastTeleMsgTime = 0;
+let latestTelemetry = {};
+let droneTrailPts = [];
+let detections = [];
+
+const teleBadge = document.getElementById('teleBadge');
+
+function setNA(id, value, unit, warnFn, decimals) {
+  const el = document.getElementById(id);
+  if (value === null || value === undefined || value === 'N/A') {
+    el.textContent = 'N/A'; el.className = 'v na'; return;
+  }
+  const d = decimals !== undefined ? decimals : 4;
+  const text = (typeof value === 'number' ? value.toFixed(d) : value) + (unit ? ' ' + unit : '');
+  el.textContent = text;
+  el.className = 'v' + (warnFn ? (' ' + warnFn(value)) : '');
+}
+function hudSet(id, value, decimals) {
+  const el = document.getElementById(id);
+  const unitSpan = el.querySelector('.unit');
+  const unitHtml = unitSpan ? unitSpan.outerHTML : '';
+  if (value === null || value === undefined) { el.innerHTML = '--' + unitHtml; return; }
+  el.innerHTML = (typeof value === 'number' ? value.toFixed(decimals ?? 0) : value) + unitHtml;
+}
+
+function updateTelemetryUI(d) {
+  latestTelemetry = d;
+  setNA('t-lat', d.lat, '', null, 6);
+  setNA('t-lon', d.lon, '', null, 6);
+  setNA('t-alt', d.alt_m, 'M', null, 1);
+  setNA('t-speed', d.speed_kmh, 'KM/H', null, 1);
+  setNA('t-heading', d.heading_deg, 'DEG', null, 0);
+  setNA('t-sats', d.satellites, '');
+  document.getElementById('t-fix').textContent = d.gps_fix === true ? 'YES' : d.gps_fix === false ? 'NO' : 'N/A';
+  document.getElementById('t-fix').className = 'v ' + (d.gps_fix ? '' : 'warn');
+  setNA('t-battery', d.battery_pct, '%', v => v < 20 ? 'bad' : v < 40 ? 'warn' : '', 0);
+  setNA('t-cputemp', d.cpu_temp_c, 'C', v => v > 75 ? 'bad' : v > 65 ? 'warn' : '', 1);
+  document.getElementById('t-lastupdate').textContent = new Date().toLocaleTimeString();
+
+  hudSet('hud-alt', d.alt_m ?? null, 0);
+  hudSet('hud-speed', d.speed_kmh ?? null, 0);
+  hudSet('hud-heading', d.heading_deg ?? null, 0);
+  hudSet('hud-battery', d.battery_pct ?? null, 0);
+  hudSet('hud-cputemp', d.cpu_temp_c ?? null, 0);
+
+  if (typeof d.lat === 'number' && typeof d.lon === 'number') {
+    const p = project(d.lat, d.lon);
+    droneTrailPts.push(`${p.x.toFixed(1)},${p.y.toFixed(1)}`);
+    if (droneTrailPts.length > 500) droneTrailPts.shift();
+    const trail = document.getElementById('droneTrail');
+    if (trail) trail.setAttribute('points', droneTrailPts.join(' '));
+    const marker = document.getElementById('droneMarker');
+    if (marker) { marker.style.display = 'block'; marker.setAttribute('transform', `translate(${p.x},${p.y})`); }
+  }
+  if (recording) logSample();
+}
+
+function addDetectionMarker(det) {
+  const g = document.getElementById('detectionMarkers');
+  if (!g || typeof det.lat !== 'number' || typeof det.lon !== 'number') return;
+  const p = project(det.lat, det.lon);
+  const pin = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+  pin.setAttribute('cx', p.x); pin.setAttribute('cy', p.y); pin.setAttribute('r', 5);
+  pin.setAttribute('fill', '#ff3b30'); pin.setAttribute('stroke', '#fff'); pin.setAttribute('stroke-width', '1');
+  pin.style.cursor = 'pointer';
+  pin.addEventListener('click', () => openLightbox(det));
+  g.appendChild(pin);
+}
+
+function connectTelemetry(url) {
+  ws = new WebSocket(url);
+  ws.onopen = () => setStatus(teleBadge, 'live', 'TELEMETRY');
+  ws.onclose = () => {
+    setStatus(teleBadge, 'lost', 'TELEMETRY');
+    if (connectedIntentional) wsRetryTimer = setTimeout(() => connectTelemetry(url), 3000);
+  };
+  ws.onerror = () => {};
+  ws.onmessage = (evt) => {
+    lastTeleMsgTime = Date.now();
+    let msg;
+    try { msg = JSON.parse(evt.data); } catch { return; }
+    if (msg.type === 'telemetry') updateTelemetryUI(msg.data || {});
+    if (msg.type === 'detection') {
+      const det = msg.data || {};
+      detections.push(det);
+      addDetectionMarker(det);
+      renderDetectionList();
+      if (recording) sessionDetections.push(det);
+      if (recording && det.image_url) {
+        saveDetectionPhoto(det);
+      }
+    }
+  };
+}
+
+setInterval(() => {
+  if (lastTeleMsgTime && Date.now() - lastTeleMsgTime > 5000 && teleBadge.classList.contains('live')) {
+    setStatus(teleBadge, 'stale', 'TELEMETRY');
+  }
+}, 1000);
+
+function teleHttpBase(wsUrl) { return wsUrl.replace(/^ws/, 'http').replace(/\/ws\/?$/, ''); }
+
+function renderDetectionList() {
+  const list = document.getElementById('detectionList');
+  document.getElementById('detCount').textContent = detections.length;
+  if (detections.length === 0) { list.innerHTML = '<div id="noDetections">None yet this session.</div>'; return; }
+  const base = teleHttpBase(document.getElementById('teleUrl').value.trim());
+  list.innerHTML = detections.slice().reverse().map(d => {
+    const img = d.image_url ? base + d.image_url : '';
+    const time = d.timestamp ? new Date(d.timestamp).toLocaleTimeString() : '--';
+    const coords = (typeof d.lat === 'number' && typeof d.lon === 'number') ? `${d.lat.toFixed(4)}, ${d.lon.toFixed(4)}` : 'N/A';
+    return `<div class="det-item" data-idx="${detections.indexOf(d)}">
+      <img src="${img}" onerror="this.style.opacity=0.15">
+      <div class="meta"><span class="t">${(d.label || 'PERSON').toUpperCase()} · ${time}</span><br>${coords}</div>
+    </div>`;
+  }).join('');
+  list.querySelectorAll('.det-item').forEach(el => {
+    el.addEventListener('click', () => openLightbox(detections[parseInt(el.dataset.idx)]));
+  });
+}
+
+function openLightbox(det) {
+  const base = teleHttpBase(document.getElementById('teleUrl').value.trim());
+  document.getElementById('lbImg').src = det.image_url ? base + det.image_url : '';
+  const time = det.timestamp ? new Date(det.timestamp).toLocaleString() : '--';
+  const coords = (typeof det.lat === 'number' && typeof det.lon === 'number') ? `${det.lat.toFixed(6)}, ${det.lon.toFixed(6)}` : 'N/A';
+  document.getElementById('lbMeta').innerHTML =
+    `<span><b>TIME</b> ${time}</span><span><b>COORDS</b> ${coords}</span><span><b>CONFIDENCE</b> ${det.confidence != null ? (det.confidence*100).toFixed(0)+'%' : 'N/A'}</span>`;
+  document.getElementById('lightbox').classList.add('open');
+}
+document.getElementById('lbClose').onclick = () => document.getElementById('lightbox').classList.remove('open');
+
+let recording = false;
+let sessionSamples = [];
+let sessionDetections = [];
+const recordBtn = document.getElementById('recordBtn');
+const chooseFolderBtn = document.getElementById('chooseFolderBtn');
+
+const FS_SUPPORTED = 'showDirectoryPicker' in window;
+let baseDirHandle = null;
+let runDirHandle = null;
+let detDirHandle = null;
+let csvWritable = null;
+let photosSaved = 0;
+
+let folderPromptShown = false;
+
+async function ensureBaseFolder() {
+  if (baseDirHandle) return true;
+  
+  if (!folderPromptShown) {
+    folderPromptShown = true;
+    try {
+      baseDirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+      document.getElementById('t-folder').textContent = baseDirHandle.name;
+      document.getElementById('t-folder').className = 'v';
+      return true;
+    } catch (e) {
+      console.log('Folder selection cancelled:', e);
+      return false;
+    }
+  }
+  return false;
+}
+
+chooseFolderBtn.onclick = async () => {
+  try {
+    baseDirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+    document.getElementById('t-folder').textContent = baseDirHandle.name;
+    document.getElementById('t-folder').className = 'v';
+  } catch (e) {}
+};
+
+function csvLine(obj) {
+  return Object.values(obj).map(v => v === null || v === undefined ? '' : v).join(',') + '\n';
+}
+
+async function logSample() {
+  const sample = {
+    t: new Date().toISOString(),
+    lat: latestTelemetry.lat ?? null, lon: latestTelemetry.lon ?? null,
+    alt_m: latestTelemetry.alt_m ?? null, speed_kmh: latestTelemetry.speed_kmh ?? null,
+    heading_deg: latestTelemetry.heading_deg ?? null, battery_pct: latestTelemetry.battery_pct ?? null,
+    cpu_temp_c: latestTelemetry.cpu_temp_c ?? null, gps_fix: latestTelemetry.gps_fix ?? null,
+    video_fps: document.getElementById('s-fps').textContent,
+    video_bitrate: document.getElementById('s-bitrate').textContent,
+  };
+  sessionSamples.push(sample);
+  document.getElementById('t-samples').textContent = sessionSamples.length;
+
+  if (csvWritable) {
+    try { await csvWritable.write(csvLine(sample)); }
+    catch (e) { console.error('CSV write failed:', e); }
+  }
+}
+
+async function saveDetectionPhoto(det) {
+  if (!detDirHandle || !det.image_url) return;
+  try {
+    const base = teleHttpBase(document.getElementById('teleUrl').value.trim());
+    const res = await fetch(base + det.image_url);
+    const blob = await res.blob();
+    const filename = det.image_url.split('/').pop() || `detection_${Date.now()}.jpg`;
+    const fileHandle = await detDirHandle.getFileHandle(filename, { create: true });
+    const writable = await fileHandle.createWritable();
+    await writable.write(blob);
+    await writable.close();
+    photosSaved++;
+    document.getElementById('t-photossaved').textContent = photosSaved;
+  } catch (e) {
+    console.error('Failed to save detection photo:', e);
+  }
+}
+
+// ====== VIDEO RECORDING FUNCTIONS ======
+function startVideoRecording() {
+  if (!video.srcObject) {
+    console.warn('No video stream available to record');
+    document.getElementById('t-video-status').textContent = '❌ No stream';
+    return false;
+  }
+  
+  try {
+    videoChunks = [];
+    videoChunkWrites = [];
+    
+    // Find a supported mime type
+    const mimeTypes = [
+      'video/webm;codecs=vp9',
+      'video/webm;codecs=vp8',
+      'video/webm'
+    ];
+    let mimeType = mimeTypes.find(t => MediaRecorder.isTypeSupported(t)) || 'video/webm';
+    
+    mediaRecorder = new MediaRecorder(video.srcObject, { 
+      mimeType: mimeType,
+      videoBitsPerSecond: 2000000 // 2 Mbps
+    });
+    
+    mediaRecorder.ondataavailable = async (event) => {
+      if (event.data && event.data.size > 0) {
+        videoChunks.push(event.data);
+        document.getElementById('t-video-status').textContent = `📹 Recording (${(videoChunks.length * 1).toFixed(0)}s)`;
+        
+        // Write chunk to disk immediately if folder available
+        if (runDirHandle && !runDirHandle.fallback) {
+          try {
+            const chunkBlob = new Blob([event.data], { type: 'video/webm' });
+            const chunkNum = videoChunks.length;
+            const chunkHandle = await runDirHandle.getFileHandle(`video_chunk_${String(chunkNum).padStart(4, '0')}.webm`, { create: true });
+            const writable = await chunkHandle.createWritable();
+            await writable.write(chunkBlob);
+            await writable.close();
+            videoChunkWrites.push(chunkNum);
+          } catch (e) {
+            console.warn('Could not write chunk to disk:', e);
+          }
+        }
+      }
+    };
+    
+    mediaRecorder.onstop = async () => {
+      // Merge all chunks into final video
+      await finalizeVideoRecording();
+    };
+    
+    mediaRecorder.onerror = (e) => {
+      console.error('MediaRecorder error:', e);
+      document.getElementById('t-video-status').textContent = '❌ Error';
+    };
+    
+    mediaRecorder.start(1000); // Record in 1-second chunks
+    videoRecordingActive = true;
+    document.getElementById('t-video-status').textContent = '📹 Recording started';
+    return true;
+  } catch (e) {
+    console.error('Failed to start video recording:', e);
+    document.getElementById('t-video-status').textContent = '❌ ' + e.message;
+    return false;
+  }
+}
+
+function stopVideoRecording() {
+  return new Promise((resolve) => {
+    if (!mediaRecorder) {
+      resolve(null);
+      return;
+    }
+    
+    if (mediaRecorder.state === 'recording') {
+      mediaRecorder.onstop = async () => {
+        const result = await finalizeVideoRecording();
+        resolve(result);
+      };
+      mediaRecorder.stop();
+    } else {
+      resolve(null);
+    }
+  });
+}
+
+async function finalizeVideoRecording() {
+  videoRecordingActive = false;
+  
+  if (videoChunks.length === 0) {
+    document.getElementById('t-video-status').textContent = '⚠️ No data';
+    return null;
+  }
+  
+  try {
+    // Create final merged video
+    const finalBlob = new Blob(videoChunks, { type: 'video/webm' });
+    
+    // Save to folder if available
+    if (runDirHandle && !runDirHandle.fallback) {
+      try {
+        const videoHandle = await runDirHandle.getFileHandle('video.webm', { create: true });
+        const writable = await videoHandle.createWritable();
+        await writable.write(finalBlob);
+        await writable.close();
+        
+        // Delete chunk files
+        for (let i = 1; i <= videoChunkWrites.length; i++) {
+          try {
+            await runDirHandle.removeEntry(`video_chunk_${String(i).padStart(4, '0')}.webm`);
+          } catch (e) {}
+        }
+        
+        document.getElementById('t-video-status').textContent = `✅ ${(finalBlob.size / 1024 / 1024).toFixed(1)} MB saved`;
+        return finalBlob;
+      } catch (e) {
+        console.warn('Could not save final video to folder:', e);
+      }
+    }
+    
+    // Fallback: Download
+    const url = URL.createObjectURL(finalBlob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `video_${Date.now()}.webm`;
+    a.click();
+    URL.revokeObjectURL(url);
+    document.getElementById('t-video-status').textContent = `✅ Downloaded (${(finalBlob.size / 1024 / 1024).toFixed(1)} MB)`;
+    return finalBlob;
+    
+  } catch (e) {
+    console.error('Failed to finalize video:', e);
+    document.getElementById('t-video-status').textContent = '❌ Failed';
+    return null;
+  }
+}
+
+async function startRunFolder() {
+  if (!baseDirHandle) {
+    const ok = await ensureBaseFolder();
+    if (!ok) return false;
+  }
+  
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  const runName = `run_${ts}`;
+  
+  try {
+    runDirHandle = await baseDirHandle.getDirectoryHandle(runName, { create: true });
+    detDirHandle = await runDirHandle.getDirectoryHandle('detections', { create: true });
+
+    const csvHandle = await runDirHandle.getFileHandle('telemetry.csv', { create: true });
+    csvWritable = await csvHandle.createWritable();
+    await csvWritable.write('timestamp,lat,lon,alt_m,speed_kmh,heading_deg,battery_pct,cpu_temp_c,gps_fix,video_fps,video_bitrate\n');
+
+    document.getElementById('t-run').textContent = runName;
+    document.getElementById('t-run').className = 'v';
+    photosSaved = 0;
+    document.getElementById('t-photossaved').textContent = '0';
+    document.getElementById('t-video-status').textContent = 'Starting...';
+    return true;
+  } catch (e) {
+    console.error('Failed to create run folder:', e);
+    return false;
+  }
+}
+
+async function finishRunFolder() {
+  // Stop video recording first
+  await stopVideoRecording();
+  
+  if (csvWritable) { try { await csvWritable.close(); } catch (e) {} csvWritable = null; }
+  if (runDirHandle) {
+    try {
+      const jsonHandle = await runDirHandle.getFileHandle('detections.json', { create: true });
+      const writable = await jsonHandle.createWritable();
+      await writable.write(JSON.stringify(sessionDetections, null, 2));
+      await writable.close();
+
+      const summaryHandle = await runDirHandle.getFileHandle('summary.json', { create: true });
+      const sw = await summaryHandle.createWritable();
+      await sw.write(JSON.stringify({
+        ended: new Date().toISOString(),
+        total_samples: sessionSamples.length,
+        total_detections: sessionDetections.length,
+        photos_saved: photosSaved,
+        video_chunks: videoChunks.length,
+      }, null, 2));
+      await sw.close();
+    } catch (e) { console.error('Failed to finalize run folder:', e); }
+  }
+}
+
+recordBtn.onclick = async () => {
+  if (!recording) {
+    sessionSamples = []; sessionDetections = [];
+    recordBtn.disabled = true;
+    let ok = true;
+    if (FS_SUPPORTED) ok = await startRunFolder();
+    recordBtn.disabled = false;
+    if (!ok) return;
+    
+    // Start video recording
+    const videoOk = startVideoRecording();
+    if (!videoOk) {
+      console.warn('Video recording not started - stream may not be ready');
+    }
+    
+    recording = true;
+    recordBtn.textContent = 'Stop recording';
+    recordBtn.classList.add('recording');
+    document.getElementById('exportCsvBtn').disabled = true;
+    document.getElementById('exportJsonBtn').disabled = true;
+    document.getElementById('chooseFolderBtn').disabled = true;
+  } else {
+    recording = false;
+    recordBtn.textContent = 'Start recording';
+    recordBtn.classList.remove('recording');
+    
+    await finishRunFolder();
+    document.getElementById('exportCsvBtn').disabled = sessionSamples.length === 0;
+    document.getElementById('exportJsonBtn').disabled = sessionSamples.length === 0;
+    document.getElementById('chooseFolderBtn').disabled = false;
+  }
+};
+
+function downloadBlob(content, filename, type) {
+  const blob = new Blob([content], { type });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+document.getElementById('exportCsvBtn').onclick = () => {
+  const headers = Object.keys(sessionSamples[0] || {});
+  const rows = [headers.join(',')].concat(sessionSamples.map(s => headers.map(h => s[h]).join(',')));
+  downloadBlob(rows.join('\n'), `sar_session_${Date.now()}.csv`, 'text/csv');
+};
+document.getElementById('exportJsonBtn').onclick = () => {
+  downloadBlob(JSON.stringify({ samples: sessionSamples, detections: sessionDetections }, null, 2),
+    `sar_session_${Date.now()}.json`, 'application/json');
+};
+
+let connectedIntentional = false;
+const connectBtn = document.getElementById('connectBtn');
+const disconnectBtn = document.getElementById('disconnectBtn');
+
+connectBtn.onclick = async () => {
+  connectBtn.disabled = true;
+  connectedIntentional = true;
+  const whepUrl = document.getElementById('whepUrl').value.trim();
+  const teleUrl = document.getElementById('teleUrl').value.trim();
+  try { await connectVideo(whepUrl); } catch (e) { console.error('Video connect failed:', e); }
+  try { connectTelemetry(teleUrl); } catch (e) { console.error('Telemetry connect failed:', e); }
+  disconnectBtn.disabled = false;
+};
+
+disconnectBtn.onclick = () => {
+  connectedIntentional = false;
+  if (wsRetryTimer) clearTimeout(wsRetryTimer);
+  if (ws) { ws.close(); ws = null; }
+  if (pc) { pc.close(); pc = null; }
+  if (statsTimer) clearInterval(statsTimer);
+  if (mediaRecorder && mediaRecorder.state === 'recording') {
+    mediaRecorder.stop();
+  }
+  video.srcObject = null;
+  videoOverlay.style.display = 'none';
+  hudBottom.style.display = 'none';
+  setStatus(videoBadge, 'lost', 'VIDEO');
+  setStatus(teleBadge, 'lost', 'TELEMETRY');
+  connectBtn.disabled = false;
+  disconnectBtn.disabled = true;
+};
+</script>
+
+</body>
+</html>
