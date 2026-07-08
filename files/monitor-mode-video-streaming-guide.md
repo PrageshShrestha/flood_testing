@@ -477,88 +477,6 @@ sudo ./rx | gst-launch-1.0 fdsrc ! h264parse ! avdec_h264 \
 - **Adaptive bitrate / packet size tuning**: match your MTU-per-injection to what your
   driver/chipset handles best (some drivers fragment or drop oversized raw frames).
 
-## 10. SAR-Streamer-Style Air/Ground Pair (Raw Radio Link, No ffmpeg/RTSP)
-
-`air_unit.py` and `ground_unit.py` reproduce the SAR streamer's architecture
-(decoupled telemetry thread, throttled/cached detection, background uplink
-queue) but replace the ffmpeg/RTSP transport with the raw monitor-mode
-802.11 injection built earlier. No Scapy in the hot path — both scripts use
-`socket.AF_PACKET`/`SOCK_RAW` directly.
-
-Install deps on both machines:
-
-```bash
-pip install opencv-python numpy
-pip install pyserial pynmea2   # optional, only needed for real GPS
-pip install ultralytics        # optional, only needed for --detect (YOLO); falls back to HOG if absent
-```
-
-### Air unit (drone / companion computer)
-
-```bash
-# 1. Monitor mode
-sudo airmon-ng check kill
-sudo airmon-ng start wlan0
-sudo iw wlan0mon set channel 149
-
-# 2. Run with a live camera
-sudo python3 air_unit.py --iface wlan0mon --camera 0 --width 640 --height 480 --fps 30
-
-# 2b. Or bench-test with a video file, no camera needed
-sudo python3 air_unit.py --iface wlan0mon --input test2.mp4 --loop
-
-# With real GPS attached:
-sudo python3 air_unit.py --iface wlan0mon --camera 0 --gps_port /dev/serial0
-```
-
-### Ground unit (laptop)
-
-```bash
-# 1. Monitor mode (same channel as air unit)
-sudo airmon-ng check kill
-sudo airmon-ng start wlan0
-sudo iw wlan0mon set channel 149
-
-# 2. Plain video + telemetry overlay, no detection
-sudo python3 ground_unit.py --iface wlan0mon
-
-# 3. With human detection (throttled every 3rd frame by default)
-sudo python3 ground_unit.py --iface wlan0mon --detect
-
-# 4. Headless (e.g. running on a Pi ground station with no monitor)
-sudo python3 ground_unit.py --iface wlan0mon --detect --no-display
-
-# 5. With detections pushed to a dashboard
-sudo python3 ground_unit.py --iface wlan0mon --detect --telemetry_url http://localhost:8765
-```
-
-### Shutdown (both ends)
-
-```bash
-# Ctrl+C the running script, then:
-sudo airmon-ng stop wlan0mon
-sudo systemctl restart NetworkManager
-```
-
-### What's different from the SAR streamer's ffmpeg/RTSP version
-
-| | ffmpeg/RTSP version | This raw-radio version |
-|---|---|---|
-| Transport | ffmpeg → RTSP over normal IP networking | Raw 802.11 frames, no IP stack at all |
-| Requires an AP/router | Yes (or direct link config) | No — point-to-point, monitor mode only |
-| Packet loss handling | TCP/RTSP handles it | None yet (occasional corrupt JPEG frames get silently dropped — see `cv2.imdecode` returning `None`) |
-| Latency | ffmpeg encode/mux/RTSP overhead | Lower — JPEG chunks go straight to the radio |
-| Range/interference behavior | Same as any Wi-Fi client link | Same broadcast-style behavior as WFB-ng, minus its FEC |
-
-### Known gap vs. the earlier C++/WFB-ng discussion
-
-This pair still has **no FEC**, so a lost chunk drops the *whole* JPEG frame
-(you'll see an occasional skipped/frozen frame rather than a corrupted one —
-`ground_unit.py`'s `cv2.imdecode` check protects against garbled JPEGs, it
-just can't recover them). If you want to close that gap next, the highest-value
-addition is Reed-Solomon FEC per frame (e.g. `zfec`), applied the same way
-WFB-ng blocks N data + K parity packets — happy to add that as a `--fec`
-option in `air_unit.py`/`ground_unit.py` if useful.
 ## 10. Combining Both: SAR Streamer (Air) + Raw Monitor-Mode Link (Ground)
 
 This section wires your SAR streamer (camera capture, throttled detection,
@@ -612,16 +530,26 @@ sudo iw wlan0mon set channel 149
 # build the receiver (from section 9)
 g++ -O2 -o rx rx.cpp
 
-# decode + display the bare H.264 stream coming off the air
-sudo ./rx | ffplay -f h264 -fflags nobuffer -flags low_delay -probesize 32 -
+# run the actual ground-side script (ground_unit.py) -- NOT a bare ffplay pipe.
+# --width/--height MUST match the air unit's --stream_width and its
+# computed stream_height exactly, or the frame math breaks.
+sudo python3 ground_unit.py --rx_path ./rx --width 640 --height 344
 
-# or, via GStreamer instead of ffplay:
-sudo ./rx | gst-launch-1.0 fdsrc ! h264parse ! avdec_h264 ! videoconvert ! autovideosink
+# optionally record the received feed to disk
+sudo python3 ground_unit.py --rx_path ./rx --width 640 --height 344 --record flight.mp4
+
+# headless (no display window, e.g. a Pi ground station)
+sudo python3 ground_unit.py --rx_path ./rx --width 640 --height 344 --no-display
 ```
 
-`ffplay` flags (`-fflags nobuffer -flags low_delay -probesize 32`) matter here —
-without them ffplay buffers several seconds of H.264 before showing anything,
-which defeats the point of the low-latency link.
+`ground_unit.py` internally chains `rx -> ffmpeg (H.264 decode, low-latency
+flags) -> cv2 display`, the mirror image of what `air_unit.py` does on the
+way out. If you just want a raw sanity check without Python, the bare
+pipe still works too:
+
+```bash
+sudo ./rx | ffplay -f h264 -fflags nobuffer -flags low_delay -probesize 32 -
+```
 
 ### Why this keeps the SAR streamer's speed fix intact
 
@@ -642,3 +570,124 @@ networking).
 - Telemetry uplink assumes a second, ordinary IP link exists (hotspot, LTE
   modem, second radio) — if you don't have one, that part just won't send
   anywhere and the script keeps working fine as a local-only detector/logger.
+## 11. File & Dependency Checklist — What Needs to Be Where
+
+### Air unit (drone / companion computer)
+
+**Files needed in the working directory:**
+
+| File | Where it comes from | Required? |
+|---|---|---|
+| `tx.cpp` → compiled `tx` binary | Section 9 of this guide | Yes |
+| `air_unit.py` | Section 10 | Yes |
+| `test2.mp4` (or any test video) | Your own footage — only needed if you don't have a live camera attached yet | Optional — omit `--input` and use `--camera` flags instead if you wire up real capture (this script currently reads via `cv2.VideoCapture(args.input)`, so a live camera would need the `--input` path swapped for a device index like `cv2.VideoCapture(0)` — ask if you want that variant) |
+| `yolov8n.pt` | Auto-downloaded by `ultralytics` on first run if `--detect` is used and internet is available; falls back to OpenCV's built-in HOG detector if `ultralytics` isn't installed | Optional |
+| `/tmp/telemetry_override.json` | Written by any of your own scripts to feed GPS/battery values in without real hardware | Optional |
+
+**System packages:**
+
+```bash
+sudo apt update
+sudo apt install -y build-essential ffmpeg python3-pip iw aircrack-ng
+```
+
+**Python packages:**
+
+```bash
+pip install --break-system-packages opencv-python numpy
+pip install --break-system-packages pyserial pynmea2   # only if using a real GPS module
+pip install --break-system-packages ultralytics         # only if using --detect with YOLO
+```
+
+**Build:**
+
+```bash
+g++ -O2 -o tx tx.cpp
+```
+
+**Run (minimum working example):**
+
+```bash
+sudo airmon-ng check kill
+sudo airmon-ng start wlan0
+sudo iw wlan0mon set channel 149
+python3 air_unit.py --input test2.mp4 --tx_path ./tx
+```
+
+---
+
+### Ground unit (laptop)
+
+**Files needed in the working directory:**
+
+| File | Where it comes from | Required? |
+|---|---|---|
+| `rx.cpp` → compiled `rx` binary | Section 9 | Yes |
+| `ground_unit.py` | Section 10/this session | Yes |
+
+That's it — the ground side has no video file, no YOLO model, no GPS
+libraries. It only decodes and displays whatever the air unit is injecting.
+
+**System packages:**
+
+```bash
+sudo apt update
+sudo apt install -y build-essential ffmpeg python3-pip iw aircrack-ng
+```
+
+**Python packages:**
+
+```bash
+pip install --break-system-packages opencv-python numpy
+```
+
+**Build:**
+
+```bash
+g++ -O2 -o rx rx.cpp
+```
+
+**Run (minimum working example):**
+
+```bash
+sudo airmon-ng check kill
+sudo airmon-ng start wlan0
+sudo iw wlan0mon set channel 149
+python3 ground_unit.py --rx_path ./rx --width 640 --height 344
+```
+
+> `--width`/`--height` must match what the air unit computed. With the
+> default `--stream_width 640` and a 1280x720 source video, `air_unit.py`
+> computes `stream_height = 640 * (720/1280) = 360`, then rounds down to
+> the nearest even number → **344 only applies if your source is a
+> 640x344-ish aspect ratio; check the console output of `air_unit.py`
+> on startup — it doesn't currently print the final resolution, so add
+> `print(stream_width, stream_height)` right after they're computed in
+> `main()` if you want to confirm the exact numbers before starting the
+> ground unit.**
+
+---
+
+### Optional third machine: the telemetry dashboard
+
+Only needed if you pass `--telemetry_url` to `air_unit.py`. This is a
+**separate normal-IP server** (not part of the monitor-mode link) that
+receives POSTed detection JPEGs + GPS/battery data. Nothing in this guide
+builds that server for you yet — `air_unit.py` just assumes something is
+listening at `<url>/detection` and accepts a multipart POST. If you want,
+I can write a minimal `telemetry_broadcaster.py` (Flask/FastAPI) to match
+what `Uplink._post_multipart()` expects.
+
+---
+
+### Quick summary table
+
+| | Air unit | Ground unit |
+|---|---|---|
+| Script | `air_unit.py` | `ground_unit.py` |
+| Compiled binary | `tx` (from `tx.cpp`) | `rx` (from `rx.cpp`) |
+| Test video | `test2.mp4` (or your own) | Not needed |
+| YOLO model | Optional, auto-downloaded | Not needed |
+| GPS libs | Optional (`pyserial`, `pynmea2`) | Not needed |
+| Monitor mode required | Yes | Yes |
+| Same Wi-Fi channel as other side | Yes | Yes |
