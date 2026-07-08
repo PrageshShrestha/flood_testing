@@ -1,5 +1,4 @@
-// rx.cpp — sniffs raw 802.11 frames matching our MAC, strips headers,
-// writes payload to stdout (pipe into GStreamer).
+// rx_debug.cpp — with debug output
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
@@ -11,7 +10,7 @@
 #include <linux/if_ether.h>
 #include <arpa/inet.h>
 
-#define IFACE "wlan0"
+#define IFACE "wlxd0374558ffd4"  // CHANGE THIS TO YOUR INTERFACE
 #define RADIOTAP_LEN 8
 
 struct ieee80211_hdr {
@@ -30,30 +29,56 @@ int main() {
     struct ifreq ifr;
     memset(&ifr, 0, sizeof(ifr));
     strncpy(ifr.ifr_name, IFACE, IFNAMSIZ - 1);
-    ioctl(sock, SIOCGIFINDEX, &ifr);
+    if (ioctl(sock, SIOCGIFINDEX, &ifr) < 0) {
+        fprintf(stderr, "Interface %s not found!\n", IFACE);
+        return 1;
+    }
 
     struct sockaddr_ll sll;
     memset(&sll, 0, sizeof(sll));
     sll.sll_family = AF_PACKET;
     sll.sll_ifindex = ifr.ifr_ifindex;
-    bind(sock, (struct sockaddr*)&sll, sizeof(sll));
+    if (bind(sock, (struct sockaddr*)&sll, sizeof(sll)) < 0) {
+        perror("bind");
+        return 1;
+    }
 
     uint8_t target_mac[6] = {0x66,0x77,0x88,0x99,0xaa,0xbb};
     uint8_t buf[65536];
 
-    fprintf(stderr, "Listening for raw frames...\n");
+    fprintf(stderr, "Listening on %s for MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+        IFACE,
+        target_mac[0], target_mac[1], target_mac[2],
+        target_mac[3], target_mac[4], target_mac[5]);
 
     while (true) {
         ssize_t n = recvfrom(sock, buf, sizeof(buf), 0, nullptr, nullptr);
-        if (n < (ssize_t)(RADIOTAP_LEN + sizeof(ieee80211_hdr))) continue;
+        if (n < 0) { perror("recvfrom"); continue; }
+        
+        fprintf(stderr, "Received %ld bytes\n", n);
+        
+        if (n < (ssize_t)(RADIOTAP_LEN + sizeof(ieee80211_hdr))) {
+            fprintf(stderr, "Packet too small: %ld bytes\n", n);
+            continue;
+        }
 
         ieee80211_hdr* hdr = (ieee80211_hdr*)(buf + RADIOTAP_LEN);
-        if (memcmp(hdr->addr1, target_mac, 6) != 0) continue;
+        
+        fprintf(stderr, "Dest MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+            hdr->addr1[0], hdr->addr1[1], hdr->addr1[2],
+            hdr->addr1[3], hdr->addr1[4], hdr->addr1[5]);
+
+        // TEMPORARILY REMOVED FILTER - accept ALL packets
+        // if (memcmp(hdr->addr1, target_mac, 6) != 0) continue;
 
         size_t payload_off = RADIOTAP_LEN + sizeof(ieee80211_hdr);
         size_t payload_len = n - payload_off;
 
-        write(STDOUT_FILENO, buf + payload_off, payload_len);
+        fprintf(stderr, "Payload size: %ld bytes\n", payload_len);
+        
+        if (payload_len > 0) {
+            write(STDOUT_FILENO, buf + payload_off, payload_len);
+        }
     }
 
     close(sock);
